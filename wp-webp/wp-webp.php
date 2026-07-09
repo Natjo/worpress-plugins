@@ -1,9 +1,9 @@
 <?php
 /**
  * Plugin Name: WP WebP
- * Description: Génère une version WebP de chaque image téléversée (et de toutes ses déclinaisons add_image_size), compatible Regenerate Thumbnails. Conversion via Imagick avec accentuation (sharpen).
- * Version: 1.0
- * Author: Votre Nom
+ * Description: Génère une version WebP de chaque image téléversée (et de toutes ses déclinaisons add_image_size), compatible Regenerate Thumbnails. Conversion via Imagick avec détection graphique near-lossless.
+ * Version: 1.1.0
+ * Author: Lonsdale studio
  */
 
 if (!defined('ABSPATH')) exit;
@@ -32,30 +32,36 @@ function wp_webp_profiles() {
             'blur'            => 0.8,
             'filter'          => 'lanczos',
             'method'          => 6,
+            'near_lossless'   => 25,
+            'graphic_colors'  => 8192,
             // Réduit la qualité juste ce qu'il faut pour que le WebP ne soit
             // jamais plus lourd que le fichier source.
             'cap_to_original' => true,
             'quality_floor'   => 70,
         ],
         'optimal' => [
-            'label'   => 'Optimal',
-            'desc'    => 'Meilleur compromis qualité / poids (recommandé).',
-            'quality' => 80,
-            'radius'  => 0,
-            'sigma'   => 0.6,
-            'blur'    => 0.9,
-            'filter'  => 'lanczos',
-            'method'  => 6,
+            'label'          => 'Optimal',
+            'desc'           => 'Meilleur compromis qualité / poids (recommandé).',
+            'quality'        => 80,
+            'radius'         => 0,
+            'sigma'          => 0.6,
+            'blur'           => 0.9,
+            'filter'         => 'lanczos',
+            'method'         => 6,
+            'near_lossless'  => 40,
+            'graphic_colors' => 8192,
         ],
         'green' => [
-            'label'   => 'Green',
-            'desc'    => 'Poids minimal, accentuation légère (fichiers très légers).',
-            'quality' => 70,
-            'radius'  => 0,
-            'sigma'   => 0.5,
-            'blur'    => 1.0,
-            'filter'  => 'triangle',
-            'method'  => 6,
+            'label'          => 'Green',
+            'desc'           => 'Poids minimal, accentuation légère (fichiers très légers).',
+            'quality'        => 70,
+            'radius'         => 0,
+            'sigma'          => 0.5,
+            'blur'           => 1.0,
+            'filter'         => 'triangle',
+            'method'         => 6,
+            'near_lossless'  => 60,
+            'graphic_colors' => 8192,
         ],
     ];
 }
@@ -75,6 +81,243 @@ function wp_webp_get_profile() {
 
 function wp_webp_imagick_available() {
     return extension_loaded('imagick') && class_exists('Imagick');
+}
+
+/**
+ * Vérifie qu'ImageMagick peut encoder le format WebP sur ce serveur.
+ */
+function wp_webp_imagick_webp_supported() {
+    if (!wp_webp_imagick_available()) {
+        return false;
+    }
+
+    try {
+        $formats = Imagick::queryFormats('WEBP');
+
+        return !empty($formats);
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/**
+ * Prépare l'environnement PHP pour un traitement par lots (mémoire / timeout).
+ */
+function wp_webp_prepare_batch_environment() {
+    if (function_exists('wp_raise_memory_limit')) {
+        wp_raise_memory_limit('admin');
+    } elseif (function_exists('ini_set')) {
+        @ini_set('memory_limit', '512M');
+    }
+
+    if (function_exists('set_time_limit')) {
+        @set_time_limit(300);
+    }
+}
+
+/**
+ * Enregistre un handler pour remonter les erreurs fatales PHP en JSON.
+ */
+function wp_webp_ajax_begin() {
+    static $registered = false;
+    if ($registered) {
+        return;
+    }
+    $registered = true;
+
+    register_shutdown_function(static function () {
+        $error = error_get_last();
+        if (!$error || !in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+            return;
+        }
+
+        error_log('[WP WebP] fatal: ' . $error['message'] . ' in ' . $error['file'] . ':' . $error['line']);
+
+        if (headers_sent()) {
+            return;
+        }
+
+        status_header(500);
+        header('Content-Type: application/json; charset=UTF-8');
+        echo wp_json_encode([
+            'success' => false,
+            'data'    => [
+                'message' => 'Erreur fatale PHP : ' . $error['message'],
+            ],
+        ]);
+    });
+}
+
+/**
+ * Compte les images JPEG/PNG de la médiathèque (requête SQL légère).
+ */
+function wp_webp_count_attachments() {
+    global $wpdb;
+
+    return (int) $wpdb->get_var(
+        "SELECT COUNT(ID) FROM {$wpdb->posts}
+         WHERE post_type = 'attachment'
+         AND post_status = 'inherit'
+         AND post_mime_type IN ('image/jpeg', 'image/jpg', 'image/png')"
+    );
+}
+
+/**
+ * IDs d'attachements image pour la génération par lots.
+ */
+function wp_webp_get_attachment_ids($page, $per_page) {
+    global $wpdb;
+
+    $per_page = max(1, (int) $per_page);
+    $offset = max(0, ((int) $page - 1) * $per_page);
+
+    $ids = $wpdb->get_col($wpdb->prepare(
+        "SELECT ID FROM {$wpdb->posts}
+         WHERE post_type = 'attachment'
+         AND post_status = 'inherit'
+         AND post_mime_type IN ('image/jpeg', 'image/jpg', 'image/png')
+         ORDER BY ID ASC
+         LIMIT %d OFFSET %d",
+        $per_page,
+        $offset
+    ));
+
+    return array_map('intval', is_array($ids) ? $ids : []);
+}
+
+/**
+ * ID de l'attachement image suivant (après $after_id).
+ */
+function wp_webp_get_next_attachment_id($after_id = 0) {
+    global $wpdb;
+
+    return (int) $wpdb->get_var($wpdb->prepare(
+        "SELECT ID FROM {$wpdb->posts}
+         WHERE post_type = 'attachment'
+         AND post_status = 'inherit'
+         AND post_mime_type IN ('image/jpeg', 'image/jpg', 'image/png')
+         AND ID > %d
+         ORDER BY ID ASC
+         LIMIT 1",
+        max(0, (int) $after_id)
+    ));
+}
+
+/**
+ * Liste des conversions à effectuer pour un attachement (original + déclinaisons).
+ */
+function wp_webp_jobs_for_attachment($attachment_id) {
+    $jobs = [
+        ['type' => 'original'],
+    ];
+
+    $metadata = wp_get_attachment_metadata($attachment_id);
+    if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
+        foreach ($metadata['sizes'] as $size_name => $size) {
+            if (empty($size['file']) || !wp_webp_size_enabled($size_name)) {
+                continue;
+            }
+            $jobs[] = [
+                'type'   => 'size',
+                'name'   => $size_name,
+                'width'  => (int) $size['width'],
+                'height' => (int) $size['height'],
+                'file'   => $size['file'],
+            ];
+        }
+    }
+
+    return $jobs;
+}
+
+/**
+ * Nombre total de fichiers WebP à générer dans la médiathèque.
+ */
+function wp_webp_count_total_jobs() {
+    global $wpdb;
+
+    $ids = $wpdb->get_col(
+        "SELECT ID FROM {$wpdb->posts}
+         WHERE post_type = 'attachment'
+         AND post_status = 'inherit'
+         AND post_mime_type IN ('image/jpeg', 'image/jpg', 'image/png')
+         ORDER BY ID ASC"
+    );
+
+    $total = 0;
+    foreach ($ids as $id) {
+        $total += count(wp_webp_jobs_for_attachment((int) $id));
+    }
+
+    return $total;
+}
+
+/**
+ * Génère un seul WebP (original ou déclinaison) pour un attachement.
+ */
+function wp_webp_process_job($attachment_id, $job_index, &$failures = null) {
+    $original = get_attached_file($attachment_id);
+    if (!$original || !file_exists($original)) {
+        wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, 'Fichier source introuvable');
+        return 0;
+    }
+
+    $jobs = wp_webp_jobs_for_attachment($attachment_id);
+    if (!isset($jobs[$job_index])) {
+        wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, 'Déclinaison introuvable');
+        return 0;
+    }
+
+    $job = $jobs[$job_index];
+
+    if ($job['type'] === 'original') {
+        return wp_webp_make_webp($original, 0, 0, false, $original, $failures, $attachment_id);
+    }
+
+    $registered = wp_webp_get_image_sizes();
+    $crop = isset($registered[$job['name']]) ? (bool) $registered[$job['name']]['crop'] : false;
+    $dir = trailingslashit(dirname($original));
+
+    return wp_webp_make_webp(
+        $original,
+        (int) $job['width'],
+        (int) $job['height'],
+        $crop,
+        $dir . $job['file'],
+        $failures,
+        $attachment_id
+    );
+}
+
+/**
+ * Passe au job suivant (déclinaison suivante ou attachement suivant).
+ */
+function wp_webp_advance_cursor($attachment_id, $job_index) {
+    $jobs = wp_webp_jobs_for_attachment($attachment_id);
+    $job_index++;
+
+    if (isset($jobs[$job_index])) {
+        return [
+            'attachment_id' => $attachment_id,
+            'job_index'     => $job_index,
+            'done'          => false,
+        ];
+    }
+
+    $next_attachment = wp_webp_get_next_attachment_id($attachment_id);
+    if ($next_attachment > 0) {
+        return [
+            'attachment_id' => $next_attachment,
+            'job_index'     => 0,
+            'done'          => false,
+        ];
+    }
+
+    return [
+        'attachment_id' => 0,
+        'job_index'     => 0,
+        'done'          => true,
+    ];
 }
 
 /**
@@ -211,6 +454,11 @@ function wp_webp_admin_page() {
             <div class="notice notice-error"><p>
                 <strong>Imagick n’est pas disponible</strong> sur ce serveur : la génération WebP est désactivée.
             </p></div>
+        <?php elseif (!wp_webp_imagick_webp_supported()) : ?>
+            <div class="notice notice-error"><p>
+                <strong>ImageMagick est installé mais le format WebP n’est pas pris en charge.</strong>
+                Contactez l’hébergeur pour activer le delegate WebP dans ImageMagick.
+            </p></div>
         <?php endif; ?>
 
         <h2>Qualité des images</h2>
@@ -225,7 +473,8 @@ function wp_webp_admin_page() {
                         filtre <?php echo esc_html(wp_webp_filter_label(isset($profile['filter']) ? $profile['filter'] : 'lanczos')); ?>,
                         resize blur <?php echo esc_html((string) $profile['blur']); ?>,
                         sharpen radius <?php echo esc_html((string) $profile['radius']); ?> / sigma <?php echo esc_html((string) $profile['sigma']); ?>,
-                        method <?php echo (int) $profile['method']; ?><?php echo !empty($profile['cap_to_original']) ? ', max original' : ''; ?>)
+                        method <?php echo (int) $profile['method']; ?><?php echo !empty($profile['cap_to_original']) ? ', max original' : ''; ?>,
+                        JPG/PNG graphiques → near-lossless <?php echo (int) ($profile['near_lossless'] ?? 40); ?>)
                     </span>
                 </label>
             <?php endforeach; ?>
@@ -362,9 +611,9 @@ function wp_webp_admin_page() {
         <hr>
 
         <h2>Generate images</h2>
-        <p class="description">Génère (ou régénère) les fichiers <code>.webp</code> pour <strong>toutes</strong> les images déjà présentes dans la médiathèque, ainsi que toutes leurs déclinaisons. Le traitement se fait par lots.</p>
+        <p class="description">Génère (ou régénère) les fichiers <code>.webp</code> pour <strong>toutes</strong> les images déjà présentes dans la médiathèque, ainsi que toutes leurs déclinaisons. <strong>Un fichier WebP est traité par requête</strong> pour limiter la charge serveur.</p>
         <p>
-            <button type="button" class="button button-primary" id="wp-webp-generate"<?php disabled(!wp_webp_imagick_available()); ?>>Générer les WebP</button>
+            <button type="button" class="button button-primary" id="wp-webp-generate"<?php disabled(!wp_webp_imagick_available() || !wp_webp_imagick_webp_supported()); ?>>Générer les WebP</button>
         </p>
         <div id="wp-webp-generate-progress" style="display:none; max-width:520px; margin:8px 0;">
             <div style="background:#e2e4e7; border-radius:999px; height:18px; overflow:hidden;">
@@ -399,11 +648,14 @@ function wp_webp_admin_page() {
                 return ' — ' + failures.length + ' fichier(s) en erreur : ' + preview + (failures.length > 8 ? '…' : '');
             }
 
-            function runBatch(page, processed, generated, failures) {
+            function runBatch(attachmentId, jobIndex, processedJobs, generated, failures) {
                 var body = new URLSearchParams();
                 body.append('action', 'wp_webp_generate_webp');
                 body.append('nonce', nonce);
-                body.append('page', String(page));
+                body.append('attachment_id', String(attachmentId));
+                body.append('job_index', String(jobIndex));
+                body.append('processed_jobs', String(processedJobs));
+                body.append('generated', String(generated));
 
                 return fetch(ajaxUrl, {
                     method: 'POST',
@@ -411,20 +663,41 @@ function wp_webp_admin_page() {
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: body.toString()
                 })
-                .then(function (r) { return r.json(); })
+                .then(function (r) {
+                    return r.text().then(function (text) {
+                        var data = null;
+                        try {
+                            data = JSON.parse(text);
+                        } catch (e) {
+                            throw new Error(text ? text.slice(0, 300) : ('HTTP ' + r.status));
+                        }
+                        if (!r.ok && data && data.data && data.data.message) {
+                            throw new Error(data.data.message);
+                        }
+                        return data;
+                    });
+                })
                 .then(function (data) {
-                    if (!data || !data.success) { throw new Error('failed'); }
-                    processed += data.data.processed;
-                    generated += data.data.generated;
+                    if (!data || !data.success) {
+                        throw new Error((data && data.data && data.data.message) ? data.data.message : 'failed');
+                    }
+                    processedJobs = data.data.processed_jobs;
+                    generated = data.data.generated;
                     failures = failures.concat(data.data.failures || []);
                     var total = data.data.total;
-                    var pct = setBar(processed, total);
-                    status.textContent = 'Traitement… ' + pct + '% (' + processed + ' / ' + total + ' image(s), ' + generated + ' WebP généré(s)).';
+                    var pct = setBar(processedJobs, total);
+                    status.textContent = 'Traitement… ' + pct + '% (' + processedJobs + ' / ' + total + ' fichier(s), ' + generated + ' WebP généré(s)).';
                     if (!data.data.done) {
-                        return runBatch(page + 1, processed, generated, failures);
+                        return runBatch(
+                            data.data.attachment_id,
+                            data.data.job_index,
+                            processedJobs,
+                            generated,
+                            failures
+                        );
                     }
                     setBar(1, 1);
-                    status.textContent = 'Terminé : ' + processed + ' image(s) traitée(s), ' + generated + ' WebP généré(s), ' + failures.length + ' erreur(s).' + renderFailures(failures);
+                    status.textContent = 'Terminé : ' + processedJobs + ' fichier(s) traité(s), ' + generated + ' WebP généré(s), ' + failures.length + ' erreur(s).' + renderFailures(failures);
                 });
             }
 
@@ -432,9 +705,9 @@ function wp_webp_admin_page() {
                 btn.disabled = true;
                 progress.style.display = '';
                 bar.style.width = '0';
-                status.textContent = 'Traitement…';
-                runBatch(1, 0, 0, []).catch(function () {
-                    status.textContent = 'Erreur lors de la génération.';
+                status.textContent = 'Initialisation…';
+                runBatch(0, 0, 0, 0, []).catch(function (err) {
+                    status.textContent = 'Erreur : ' + (err && err.message ? err.message : 'lors de la génération.');
                 }).finally(function () {
                     btn.disabled = false;
                 });
@@ -503,49 +776,85 @@ function wp_webp_admin_page() {
 add_action('wp_ajax_wp_webp_generate_webp', 'wp_webp_ajax_generate_webp');
 
 function wp_webp_ajax_generate_webp() {
-    if (!current_user_can('manage_options')) {
-        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    wp_webp_ajax_begin();
+
+    try {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+        }
+
+        check_ajax_referer('wp_webp_generate_action', 'nonce');
+
+        if (!wp_webp_imagick_available()) {
+            wp_send_json_error(['message' => 'Imagick indisponible.'], 500);
+        }
+
+        if (!wp_webp_imagick_webp_supported()) {
+            wp_send_json_error(['message' => 'ImageMagick ne supporte pas le format WebP sur ce serveur.'], 500);
+        }
+
+        wp_webp_prepare_batch_environment();
+
+        $attachment_id = isset($_POST['attachment_id']) ? max(0, (int) $_POST['attachment_id']) : 0;
+        $job_index = isset($_POST['job_index']) ? max(0, (int) $_POST['job_index']) : 0;
+        $processed_jobs = isset($_POST['processed_jobs']) ? max(0, (int) $_POST['processed_jobs']) : 0;
+        $generated_total = isset($_POST['generated']) ? max(0, (int) $_POST['generated']) : 0;
+
+        if ($attachment_id === 0) {
+            delete_transient('wp_webp_total_jobs');
+            $attachment_id = wp_webp_get_next_attachment_id(0);
+            $job_index = 0;
+
+            if ($attachment_id === 0) {
+                wp_send_json_success([
+                    'attachment_id'  => 0,
+                    'job_index'      => 0,
+                    'processed_jobs' => 0,
+                    'generated'      => 0,
+                    'total'          => 0,
+                    'done'           => true,
+                    'failures'       => [],
+                ]);
+            }
+
+            set_transient('wp_webp_total_jobs', wp_webp_count_total_jobs(), HOUR_IN_SECONDS);
+        }
+
+        $total = (int) get_transient('wp_webp_total_jobs');
+        $failures = [];
+        $generated = 0;
+
+        try {
+            $generated = wp_webp_process_job($attachment_id, $job_index, $failures);
+        } catch (Throwable $e) {
+            $failures[] = [
+                'file'  => 'attachment #' . (int) $attachment_id,
+                'error' => $e->getMessage(),
+            ];
+            error_log('[WP WebP] job attachment #' . (int) $attachment_id . ' index ' . (int) $job_index . ': ' . $e->getMessage());
+        }
+
+        $cursor = wp_webp_advance_cursor($attachment_id, $job_index);
+        $processed_jobs++;
+
+        if ($cursor['done']) {
+            delete_transient('wp_webp_total_jobs');
+        }
+
+        wp_send_json_success([
+            'attachment_id'  => $cursor['attachment_id'],
+            'job_index'      => $cursor['job_index'],
+            'processed_jobs' => $processed_jobs,
+            'generated'      => $generated_total + $generated,
+            'total'          => $total,
+            'done'           => $cursor['done'],
+            'failures'       => $failures,
+        ]);
+    } catch (Throwable $e) {
+        delete_transient('wp_webp_total_jobs');
+        error_log('[WP WebP] generate batch failed: ' . $e->getMessage());
+        wp_send_json_error(['message' => $e->getMessage()], 500);
     }
-
-    check_ajax_referer('wp_webp_generate_action', 'nonce');
-
-    if (!wp_webp_imagick_available()) {
-        wp_send_json_error(['message' => 'Imagick indisponible.'], 500);
-    }
-
-    $batch = 10;
-    $page = isset($_POST['page']) ? max(1, (int) $_POST['page']) : 1;
-
-    $query = new WP_Query([
-        'post_type'      => 'attachment',
-        'post_status'    => 'inherit',
-        'post_mime_type' => ['image/jpeg', 'image/png'],
-        'fields'         => 'ids',
-        'posts_per_page' => $batch,
-        'paged'          => $page,
-        'orderby'        => 'ID',
-        'order'          => 'ASC',
-    ]);
-
-    $processed = 0;
-    $generated = 0;
-    $failures = [];
-    foreach ($query->posts as $attachment_id) {
-        $generated += wp_webp_generate_for_attachment($attachment_id, $failures);
-        $processed++;
-    }
-
-    $total = (int) $query->found_posts;
-    $done = ($page * $batch) >= $total || empty($query->posts);
-
-    wp_send_json_success([
-        'processed' => $processed,
-        'generated' => $generated,
-        'total'     => $total,
-        'page'      => $page,
-        'done'      => $done,
-        'failures'  => $failures,
-    ]);
 }
 
 /**
@@ -620,8 +929,10 @@ function wp_webp_delete_all_webp($dir) {
 add_filter('wp_generate_attachment_metadata', 'wp_webp_on_generate_metadata', 10, 2);
 
 function wp_webp_on_generate_metadata($metadata, $attachment_id) {
+    wp_webp_clear_graphic_cache($attachment_id);
+
     if (wp_webp_imagick_available()) {
-        wp_webp_process_attachment($attachment_id);
+        wp_webp_process_attachment($attachment_id, null, $metadata);
     }
 
     return $metadata;
@@ -632,11 +943,12 @@ function wp_webp_on_generate_metadata($metadata, $attachment_id) {
  * format à partir de l'image originale (resizeImage), au lieu de convertir les
  * vignettes déjà produites par WordPress (souvent un peu floues).
  *
- * @param int        $attachment_id
- * @param array|null $failures Rempli (par référence) avec les fichiers en échec.
+ * @param int             $attachment_id
+ * @param array|null      $failures  Rempli (par référence) avec les fichiers en échec.
+ * @param array|null|false $metadata Métadonnées fraîches (filtre wp_generate_attachment_metadata).
  * @return int Nombre de fichiers WebP réellement générés.
  */
-function wp_webp_process_attachment($attachment_id, &$failures = null) {
+function wp_webp_process_attachment($attachment_id, &$failures = null, $metadata = null) {
     $original = get_attached_file($attachment_id);
     if (!$original || !file_exists($original)) {
         wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, 'Fichier source introuvable');
@@ -644,9 +956,11 @@ function wp_webp_process_attachment($attachment_id, &$failures = null) {
     }
 
     // Image originale : conversion directe (pas de redimensionnement).
-    $generated = wp_webp_make_webp($original, 0, 0, false, $original, $failures);
+    $generated = wp_webp_make_webp($original, 0, 0, false, $original, $failures, $attachment_id);
 
-    $metadata = wp_get_attachment_metadata($attachment_id);
+    if ($metadata === null) {
+        $metadata = wp_get_attachment_metadata($attachment_id);
+    }
     $registered = wp_webp_get_image_sizes();
 
     if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
@@ -662,7 +976,8 @@ function wp_webp_process_attachment($attachment_id, &$failures = null) {
                 (int) $size['height'],
                 $crop,
                 $dir . $size['file'],
-                $failures
+                $failures,
+                $attachment_id
             );
         }
     }
@@ -715,6 +1030,143 @@ function wp_webp_resolve_filter($name) {
 }
 
 /**
+ * Clé de cache (transient) pour la détection graphique d'un attachement.
+ */
+function wp_webp_graphic_cache_key($attachment_id) {
+    return 'wp_webp_gfx_' . max(0, (int) $attachment_id);
+}
+
+/**
+ * Invalide le cache de détection graphique.
+ */
+function wp_webp_clear_graphic_cache($attachment_id) {
+    if ($attachment_id > 0) {
+        delete_transient(wp_webp_graphic_cache_key($attachment_id));
+    }
+}
+
+/**
+ * Détecte une image « graphique » JPG/PNG (aplats de couleur, peu de teintes distinctes).
+ * Analyse une miniature pour limiter le coût CPU.
+ */
+function wp_webp_is_graphic_image(Imagick $img, array $profile) {
+    $format = strtolower($img->getImageFormat());
+    if (!in_array($format, ['jpeg', 'jpg', 'png'], true)) {
+        return false;
+    }
+
+    $max_colors = isset($profile['graphic_colors']) ? (int) $profile['graphic_colors'] : 8192;
+    $sample = null;
+
+    try {
+        $sample = clone $img;
+        $sample->thumbnailImage(160, 160, true);
+        $colors = (int) $sample->getImageColors();
+
+        return $colors > 0 && $colors <= $max_colors;
+    } catch (Throwable $e) {
+        return false;
+    } finally {
+        if ($sample instanceof Imagick) {
+            $sample->clear();
+            $sample->destroy();
+        }
+    }
+}
+
+/**
+ * Analyse le fichier original JPG/PNG (sans redimensionnement).
+ */
+function wp_webp_detect_graphic_file($path, array $profile) {
+    if (!preg_match('/\.(jpe?g|png)$/i', $path) || !file_exists($path)) {
+        return false;
+    }
+
+    $img = null;
+
+    try {
+        $img = new Imagick($path);
+        return wp_webp_is_graphic_image($img, $profile);
+    } catch (Throwable $e) {
+        return false;
+    } finally {
+        if ($img instanceof Imagick) {
+            $img->clear();
+            $img->destroy();
+        }
+    }
+}
+
+/**
+ * Résultat graphique / photo, mis en cache par attachement (requête + transient).
+ */
+function wp_webp_resolve_graphic_image($attachment_id, $original_path, array $profile) {
+    static $request_cache = [];
+
+    $attachment_id = (int) $attachment_id;
+    $cache_key = $attachment_id > 0
+        ? 'a' . $attachment_id
+        : 'p' . md5($original_path . '|' . (file_exists($original_path) ? (string) filemtime($original_path) : ''));
+
+    if (array_key_exists($cache_key, $request_cache)) {
+        return $request_cache[$cache_key];
+    }
+
+    if ($attachment_id > 0) {
+        $cached = get_transient(wp_webp_graphic_cache_key($attachment_id));
+        if ($cached !== false) {
+            $request_cache[$cache_key] = ((int) $cached) === 1;
+            return $request_cache[$cache_key];
+        }
+    }
+
+    $result = wp_webp_detect_graphic_file($original_path, $profile);
+    $request_cache[$cache_key] = $result;
+
+    if ($attachment_id > 0) {
+        set_transient(wp_webp_graphic_cache_key($attachment_id), $result ? 1 : 0, HOUR_IN_SECONDS);
+    }
+
+    return $result;
+}
+
+/**
+ * Applique les options Imagick WebP (lossy ou near-lossless).
+ */
+function wp_webp_apply_webp_options(Imagick $img, array $profile, $near_lossless = false) {
+    $img->setImageFormat('webp');
+
+    if (!method_exists($img, 'setOption')) {
+        return;
+    }
+
+    try {
+        $img->setOption('webp:method', (string) $profile['method']);
+    } catch (Throwable $e) {
+        // Option non supportée sur cette build ImageMagick.
+    }
+
+    if (!$near_lossless) {
+        return;
+    }
+
+    $level = isset($profile['near_lossless']) ? max(0, min(100, (int) $profile['near_lossless'])) : 40;
+
+    try {
+        $img->setOption('webp:near-lossless', (string) $level);
+        $img->setImageCompressionQuality(100);
+    } catch (Throwable $e) {
+        return;
+    }
+
+    try {
+        $img->setOption('webp:use-sharp-yuv', 'true');
+    } catch (Throwable $e) {
+        // Option absente sur certaines versions.
+    }
+}
+
+/**
  * Génère un fichier WebP à partir de l'image ORIGINALE.
  *
  * @param string     $original_path Chemin de l'image originale (source des pixels).
@@ -724,9 +1176,10 @@ function wp_webp_resolve_filter($name) {
  * @param string     $output_source Chemin du fichier WP correspondant : sert à
  *                                  nommer le .webp et de référence pour le plafond.
  * @param array|null $failures      Rempli en cas d'échec.
+ * @param int        $attachment_id ID WordPress (cache détection graphique).
  * @return int 1 si généré, 0 sinon.
  */
-function wp_webp_make_webp($original_path, $width, $height, $crop, $output_source, &$failures = null) {
+function wp_webp_make_webp($original_path, $width, $height, $crop, $output_source, &$failures = null, $attachment_id = 0) {
     $target = wp_webp_target_path($output_source);
     if ($target === '') {
         wp_webp_record_failure($failures, wp_webp_relative_upload_path($output_source), 'Format non pris en charge');
@@ -738,10 +1191,11 @@ function wp_webp_make_webp($original_path, $width, $height, $crop, $output_sourc
     }
 
     $profile = wp_webp_get_profile();
+    $near_lossless = wp_webp_resolve_graphic_image($attachment_id, $original_path, $profile);
+    $img = null;
 
     try {
-        $imagick_class = 'Imagick';
-        $img = new $imagick_class($original_path);
+        $img = new Imagick($original_path);
         $img->stripImage();
 
         // Recréation du format depuis l'original via resizeImage (contrôle du
@@ -766,45 +1220,58 @@ function wp_webp_make_webp($original_path, $width, $height, $crop, $output_sourc
             }
         }
 
-        // Accentuation : Imagick::sharpenImage($radius, $sigma).
+        // Accentuation : éviter les halos sur les aplats (near-lossless suffit).
         $radius = isset($profile['radius']) ? (float) $profile['radius'] : 0;
         $sigma = isset($profile['sigma']) ? (float) $profile['sigma'] : 0;
-        if ($sigma > 0) {
-            $img->sharpenImage($radius, $sigma);
-        }
-
-        $img->setImageFormat('webp');
-        $img->setOption('webp:method', (string) $profile['method']);
-
-        $quality = (int) $profile['quality'];
-        $img->setImageCompressionQuality($quality);
-        $blob = $img->getImageBlob();
-
-        // Plafonnement : le WebP ne doit pas dépasser le poids du fichier de
-        // référence (l'image originale ou la vignette WP correspondante).
-        if (!empty($profile['cap_to_original']) && file_exists($output_source)) {
-            $ref = filesize($output_source);
-            $floor = isset($profile['quality_floor']) ? (int) $profile['quality_floor'] : 60;
-            while ($ref && strlen($blob) > $ref && $quality > $floor) {
-                $quality = max($floor, $quality - 5);
-                $img->setImageCompressionQuality($quality);
-                $blob = $img->getImageBlob();
+        if (!$near_lossless && $sigma > 0) {
+            $pixels = $img->getImageWidth() * $img->getImageHeight();
+            if ($pixels > 0 && $pixels <= 20000000) {
+                $img->sharpenImage($radius, $sigma);
             }
         }
 
-        $written = file_put_contents($target, $blob);
-        $img->clear();
-        $img->destroy();
+        wp_webp_apply_webp_options($img, $profile, $near_lossless);
 
-        if ($written === false) {
+        $quality = (int) $profile['quality'];
+        if (!$near_lossless) {
+            $img->setImageCompressionQuality($quality);
+        }
+
+        // Plafonnement : inutile en near-lossless (priorité à la netteté des aplats).
+        if (!$near_lossless && !empty($profile['cap_to_original']) && file_exists($output_source)) {
+            $ref = filesize($output_source);
+            $floor = isset($profile['quality_floor']) ? (int) $profile['quality_floor'] : 60;
+            $attempts = 0;
+            while ($ref && $attempts < 6 && $quality > $floor) {
+                $tmp = $target . '.tmp';
+                if (!$img->writeImage($tmp)) {
+                    break;
+                }
+                if (filesize($tmp) <= $ref) {
+                    @rename($tmp, $target);
+                    return 1;
+                }
+                @unlink($tmp);
+                $quality = max($floor, $quality - 5);
+                $img->setImageCompressionQuality($quality);
+                $attempts++;
+            }
+        }
+
+        if (!$img->writeImage($target)) {
             wp_webp_record_failure($failures, wp_webp_relative_upload_path($target), 'Écriture du fichier WebP impossible');
             return 0;
         }
 
         return 1;
-    } catch (Exception $e) {
+    } catch (Throwable $e) {
         wp_webp_record_failure($failures, wp_webp_relative_upload_path($output_source), $e->getMessage());
         return 0;
+    } finally {
+        if ($img instanceof Imagick) {
+            $img->clear();
+            $img->destroy();
+        }
     }
 }
 
@@ -827,6 +1294,8 @@ function wp_webp_record_failure(&$failures, $file, $error) {
 add_action('delete_attachment', 'wp_webp_on_delete_attachment');
 
 function wp_webp_on_delete_attachment($attachment_id) {
+    wp_webp_clear_graphic_cache($attachment_id);
+
     $original = get_attached_file($attachment_id);
     if ($original) {
         wp_webp_delete_for($original);
