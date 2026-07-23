@@ -18,15 +18,62 @@ Conversion via **Imagick**, avec profils de qualité et détection automatique d
 
 Convention de nommage : `photo.jpg` → `photo.webp` (l’extension est remplacée, pas ajoutée).
 
+La désactivation d’un format supprime progressivement ses anciens WebP par lots
+de 100 attachements. La suppression globale parcourt `uploads` par lots de
+250 entrées et conserve toujours les médias WebP téléversés directement ainsi
+que leurs déclinaisons.
+
 ## Détection graphique (near-lossless)
 
 Pour les JPG et PNG contenant peu de couleurs distinctes (illustrations, logos, aplats), le plugin encode en **WebP near-lossless** afin de préserver les bords nets. Les photos (nombreuses couleurs) restent en WebP lossy classique.
 
 L’analyse est effectuée **une fois par image source** (cache par attachement).
 
+## Performance et mémoire
+
+- À l’upload et pendant Regenerate Thumbnails, l’original est décodé une seule
+  fois puis cloné pour produire ses déclinaisons.
+- Les images trop grandes repassent automatiquement sur un décodage par fichier
+  afin de limiter le pic mémoire. Le seuil tient compte de la limite Imagick,
+  est plafonné à 12 mégapixels et peut être ajusté avec le filtre
+  `wp_webp_reuse_source_max_pixels` (`0` désactive la réutilisation).
+- La génération globale compte les attachements avec une requête SQL légère :
+  elle ne charge plus les métadonnées de toute la médiathèque au démarrage.
+- Chaque lancement possède sa propre session temporaire, isolée par utilisateur
+  et par exécution. Deux administrateurs peuvent donc lancer une génération sans
+  mélanger leur progression.
+- La suppression globale est asynchrone et reprend son parcours de dossiers
+  entre les requêtes AJAX, ce qui évite un timeout sur un gros dossier `uploads`.
+
 ---
 
 ## Notes de version
+
+### 1.1.1 — 2026-07-23
+
+**Robustesse**
+- Correction du passage par référence avec Regenerate Thumbnails.
+- Écriture atomique via un fichier temporaire unique, avec contrôle du renommage.
+- Journalisation limitée des erreurs pendant l’upload et la régénération.
+- La suppression globale préserve les attachements WebP natifs.
+- Désactiver une taille nettoie ses anciens WebP par lots.
+- Vérification explicite du support WebP et filtrage strict des sources JPEG/PNG.
+- Validation des noms de fichiers et dimensions issus des métadonnées.
+- Respect des positions de recadrage WordPress (`left`, `center`, `right`, `top`, `bottom`).
+- Fusion des métadonnées existantes lors d’une régénération limitée aux tailles manquantes.
+- Nettoyage des WebP correspondant aux anciennes tailles ou anciens noms de fichiers.
+
+**Performance**
+- Décodage partagé de l’original pour toutes ses déclinaisons, avec garde mémoire.
+- Comptage initial sans chargement des métadonnées de la médiathèque.
+- Sessions de génération indépendantes par utilisateur et par lancement.
+- Suppression globale découpée en lots de 250 entrées.
+- Retrait des anciennes fonctions internes inutilisées.
+
+**Qualité**
+- Profils photo conservés à `85 / 80 / 70`.
+- Near-lossless recalibré à `85 / 60 / 40` pour Best / Optimal / Green.
+- Le profil Best privilégie désormais la fidélité et n’est plus plafonné au poids du fichier source.
 
 ### 1.1.0 — 2026-07-09
 

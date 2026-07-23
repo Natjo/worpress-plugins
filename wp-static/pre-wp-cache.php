@@ -11,6 +11,23 @@
  * maintenable et mise à jour sans réécrire index.php.
  */
 
+if (!function_exists('wp_static_pre_wp_valid_generation_token')) {
+    function wp_static_pre_wp_valid_generation_token($base_dir, $request_token) {
+        if (!is_string($request_token) || $request_token === '') {
+            return false;
+        }
+
+        $content_dir = dirname(rtrim($base_dir, '/\\'));
+        $real_content_dir = realpath($content_dir);
+        $token_root = $real_content_dir !== false ? $real_content_dir : $content_dir;
+        $token_file = rtrim(sys_get_temp_dir(), '/\\')
+            . '/wp-static-' . sha1(str_replace('\\', '/', $token_root)) . '.token';
+        $stored_token = is_file($token_file) ? trim((string) @file_get_contents($token_file)) : '';
+
+        return $stored_token !== '' && hash_equals($stored_token, $request_token);
+    }
+}
+
 if (!function_exists('wp_static_serve_pre_wp')) {
     /**
      * Sert le fichier statique correspondant à l'URL courante puis arrête le
@@ -25,9 +42,15 @@ if (!function_exists('wp_static_serve_pre_wp')) {
         if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'GET') {
             return;
         }
-        // Requête de génération (jeton) : laisser WordPress rendre la page fraîche.
+        // Requête de génération : le jeton doit aussi correspondre au fichier
+        // temporaire écrit par le plugin. Un simple en-tête forgé ne suffit pas.
         if (!empty($_SERVER['HTTP_X_WP_STATIC_TOKEN'])) {
-            return;
+            if (wp_static_pre_wp_valid_generation_token(
+                $base_dir,
+                (string) $_SERVER['HTTP_X_WP_STATIC_TOKEN']
+            )) {
+                return;
+            }
         }
         if (!empty($_SERVER['QUERY_STRING'])) {
             return;
@@ -65,17 +88,24 @@ if (!function_exists('wp_static_serve_pre_wp')) {
 
         $rel = trim(rawurldecode($path), '/');
 
-        // Candidats : d'abord le dossier spécifique à l'hôte (WPML multi-domaines),
-        // puis le dossier racine.
+        // En multi-domaines, ne jamais retomber sur la racine lorsqu'un arbre
+        // `_hosts` existe : cela pourrait servir la langue principale sur un
+        // autre domaine.
         $candidates = array();
-        $host = isset($_SERVER['HTTP_HOST'])
-            ? preg_replace('/[^a-z0-9.\-]/i', '', strtolower($_SERVER['HTTP_HOST']))
-            : '';
-        if ($host !== '') {
+        $host = '';
+        if (!empty($_SERVER['HTTP_HOST'])) {
+            $parsed_host = parse_url('http://' . $_SERVER['HTTP_HOST'], PHP_URL_HOST);
+            if (is_string($parsed_host)) {
+                $host = preg_replace('/[^a-z0-9.\-]/i', '', strtolower($parsed_host));
+            }
+        }
+        $hosts_base = $base_dir . '/_hosts';
+        if ($host !== '' && is_dir($hosts_base)) {
             $host_base = $base_dir . '/_hosts/' . $host;
             $candidates[] = ($rel === '') ? $host_base . '/index.html' : $host_base . '/' . $rel . '/index.html';
+        } else {
+            $candidates[] = ($rel === '') ? $base_dir . '/index.html' : $base_dir . '/' . $rel . '/index.html';
         }
-        $candidates[] = ($rel === '') ? $base_dir . '/index.html' : $base_dir . '/' . $rel . '/index.html';
 
         foreach ($candidates as $file) {
             $real = realpath($file);
@@ -97,8 +127,11 @@ if (!function_exists('wp_static_serve_pre_wp')) {
             $if_none_match = isset($_SERVER['HTTP_IF_NONE_MATCH']) ? trim($_SERVER['HTTP_IF_NONE_MATCH']) : '';
             $if_modified_since = isset($_SERVER['HTTP_IF_MODIFIED_SINCE']) ? strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']) : false;
 
-            if (($if_none_match !== '' && $if_none_match === $etag)
-                || ($if_modified_since !== false && $if_modified_since >= $mtime)) {
+            $not_modified = $if_none_match !== ''
+                ? $if_none_match === $etag
+                : ($if_modified_since !== false && $if_modified_since >= $mtime);
+
+            if ($not_modified) {
                 http_response_code(304);
                 exit;
             }
