@@ -3,7 +3,7 @@
 /**
  * Plugin Name: WP Static
  * Description: Génère des pages statiques de votre site WordPress et les sert pour améliorer les performances.
- * Version: 1.2.0
+ * Version: 1.2.3
  * Author: Lonsdale studio
  */
 
@@ -15,12 +15,14 @@ define('WP_STATIC_ENABLED_OPTION', 'wp_static_enabled');
 define('WP_STATIC_MINIFY_OPTION', 'wp_static_minify');
 define('WP_STATIC_AUTO_OPTION', 'wp_static_auto');
 define('WP_STATIC_MODE_OPTION', 'wp_static_mode');
+define('WP_STATIC_SERVE_LOGGED_IN_OPTION', 'wp_static_serve_logged_in');
 define('WP_STATIC_HTACCESS_USER_OPTION', 'wp_static_htaccess_user');
 define('WP_STATIC_HTACCESS_PASS_OPTION', 'wp_static_htaccess_pass');
 define('WP_STATIC_EXPORT_FOLDER_OPTION', 'wp_static_export_folder');
 define('WP_STATIC_HIDDEN_TYPES_OPTION', 'wp_static_hidden_post_types');
 define('WP_STATIC_DEPS_OPTION', 'wp_static_url_deps');
 define('WP_STATIC_DIRTY_OPTION', 'wp_static_dirty');
+define('WP_STATIC_LAST_RESULT_OPTION', 'wp_static_last_generation_result');
 define('WP_STATIC_GEN_TOKEN_TRANSIENT', 'wp_static_gen_token');
 define('WP_STATIC_EXCLUDED_OPTION', 'wp_static_excluded_urls');
 define('WP_STATIC_EXCLUDE_PATTERNS_OPTION', 'wp_static_exclude_patterns');
@@ -299,6 +301,22 @@ function wp_static_is_minify_enabled()
 }
 
 /**
+ * Préférence enregistrée pour le service statique aux utilisateurs connectés.
+ * En mode Complet, le comportement effectif est forcé sans écraser ce choix.
+ */
+function wp_static_serve_logged_in_preference()
+{
+    return (bool) get_option(WP_STATIC_SERVE_LOGGED_IN_OPTION, false);
+}
+
+function wp_static_should_serve_logged_in($mode = null)
+{
+    $mode = $mode === null ? wp_static_get_mode() : $mode;
+
+    return $mode === 'full' || wp_static_serve_logged_in_preference();
+}
+
+/**
  * Mode de régénération :
  * - 'manual' : rien n'est régénéré automatiquement, le site est marqué « à régénérer » ;
  * - 'auto'   : seules les pages impactées sont régénérées (dépendances, listings, classes…) ;
@@ -342,6 +360,9 @@ function wp_static_set_mode($mode)
     // La fréquence reste mémorisée en mode manuel, mais aucun événement de
     // régénération automatique ne doit y rester planifié.
     wp_static_reschedule_cron(wp_static_effective_cron_frequency($mode));
+    if (wp_static_is_enabled()) {
+        wp_static_inject_index();
+    }
 
     return $mode;
 }
@@ -593,6 +614,7 @@ add_action('admin_post_wp_static_generate', 'wp_static_handle_generate_request')
 add_action('admin_post_wp_static_export', 'wp_static_handle_export');
 add_action('wp_ajax_wp_static_toggle', 'wp_static_ajax_toggle');
 add_action('wp_ajax_wp_static_toggle_minify', 'wp_static_ajax_toggle_minify');
+add_action('wp_ajax_wp_static_toggle_serve_logged_in', 'wp_static_ajax_toggle_serve_logged_in');
 add_action('wp_ajax_wp_static_toggle_purge_orphans', 'wp_static_ajax_toggle_purge_orphans');
 add_action('wp_ajax_wp_static_toggle_auto', 'wp_static_ajax_toggle_auto');
 add_action('wp_ajax_wp_static_save_htaccess', 'wp_static_ajax_save_htaccess');
@@ -703,6 +725,7 @@ function wp_static_admin_page_content()
     $preprod_credentials_missing = wp_static_preprod_credentials_missing();
     $static_enabled = wp_static_is_enabled();
     $needs_initial_generation = $static_enabled && !wp_static_has_generated_pages();
+    $last_generation = wp_static_get_last_generation_result();
     $result_transient = WP_STATIC_RESULT_TRANSIENT_PREFIX . get_current_user_id();
     $result = get_transient($result_transient);
     delete_transient($result_transient);
@@ -772,6 +795,11 @@ function wp_static_admin_page_content()
             </div>
             <span id="wp-static-mode-badge" class="wp-static-mode-badge"><?php echo esc_html($badge_label); ?></span>
             <p class="description" id="wp-static-mode-desc"><?php echo esc_html($mode_descriptions[$mode]); ?></p>
+            <p class="description">
+                En mode Complet, le front statique est également servi aux utilisateurs connectés.
+                Dans les autres modes, ce comportement dépend du réglage dédié.
+                Vérifiez l’en-tête <code>X-Static-Cache: HIT-PRE-WP</code>.
+            </p>
         </div>
         <?php if ($preprod_credentials_missing) : ?>
             <div class="notice notice-error inline">
@@ -978,6 +1006,39 @@ function wp_static_admin_page_content()
                 max-width: 720px;
             }
 
+            .wp-static-last-generation {
+                max-width: 760px;
+                margin-top: 20px;
+                padding: 12px 16px;
+                border: 1px solid #c3c4c7;
+                border-left: 4px solid #2271b1;
+                background: #fff;
+            }
+
+            .wp-static-last-generation h3 {
+                margin: 0 0 8px;
+            }
+
+            .wp-static-last-generation p {
+                margin: 0 0 8px;
+            }
+
+            .wp-static-last-generation > ul {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px 20px;
+                margin: 0;
+            }
+
+            .wp-static-last-generation details {
+                margin-top: 10px;
+            }
+
+            .wp-static-last-generation details ul {
+                max-height: 240px;
+                overflow: auto;
+            }
+
             .wp-static-tab-panel {
                 margin-top: 16px;
             }
@@ -997,9 +1058,14 @@ function wp_static_admin_page_content()
                 flex: 0 0 auto;
             }
 
-            .wp-static-toggle input {
+            .wp-static-toggle input,
+            .wp-static-toggle input:disabled {
                 position: absolute;
-                opacity: 0;
+                appearance: none;
+                opacity: 0 !important;
+                border: 0;
+                margin: 0;
+                padding: 0;
                 width: 0;
                 height: 0;
             }
@@ -1123,6 +1189,34 @@ function wp_static_admin_page_content()
                     <option value="full" <?php selected($wp_static_mode, 'full'); ?>>Complet</option>
                 </select>
             </div>
+            <?php
+            $wp_static_serve_logged_in_preference = wp_static_serve_logged_in_preference();
+            $wp_static_serve_logged_in = wp_static_should_serve_logged_in($wp_static_mode);
+            $wp_static_serve_logged_in_forced = $wp_static_mode === 'full';
+            ?>
+            <div class="wp-static-setting">
+                <label class="wp-static-toggle">
+                    <input
+                        type="checkbox"
+                        id="wp-static-serve-logged-in"
+                        data-stored="<?php echo $wp_static_serve_logged_in_preference ? '1' : '0'; ?>"
+                        <?php checked($wp_static_serve_logged_in); ?>
+                        <?php disabled($wp_static_serve_logged_in_forced); ?>
+                    >
+                    <span class="wp-static-slider"></span>
+                </label>
+                <label for="wp-static-serve-logged-in">
+                    Servir le site statique aux utilisateurs connectés.
+                </label>
+                <span class="wp-static-status" id="wp-static-serve-logged-in-status" aria-live="polite"></span>
+            </div>
+            <p class="description" id="wp-static-serve-logged-in-desc" style="margin: -8px 0 16px 0;">
+                <?php if ($wp_static_serve_logged_in_forced) : ?>
+                    Activé automatiquement en mode Complet : le front reste statique même avec une session WordPress.
+                <?php else : ?>
+                    L’administration, les prévisualisations et les URLs avec paramètres restent dynamiques.
+                <?php endif; ?>
+            </p>
             <div id="wp-static-always-regen-wrap" <?php echo $wp_static_mode === 'auto' ? '' : ' style="display: none;"'; ?>>
                 <table class="form-table" role="presentation">
                     <tr>
@@ -1216,6 +1310,8 @@ function wp_static_admin_page_content()
                     };
                     var desc = document.getElementById('wp-static-mode-desc');
                     var descText = <?php echo wp_json_encode($mode_descriptions); ?>;
+                    var loggedInInput = document.getElementById('wp-static-serve-logged-in');
+                    var loggedInDesc = document.getElementById('wp-static-serve-logged-in-desc');
 
                     function syncAlwaysRegen() {
                         if (alwaysWrap) {
@@ -1227,12 +1323,25 @@ function wp_static_admin_page_content()
                         if (desc && descText[select.value]) {
                             desc.textContent = descText[select.value];
                         }
+                        if (loggedInInput) {
+                            var forced = select.value === 'full';
+                            loggedInInput.checked = forced || loggedInInput.dataset.stored === '1';
+                            loggedInInput.disabled = forced;
+                            if (loggedInDesc) {
+                                loggedInDesc.textContent = forced
+                                    ? 'Activé automatiquement en mode Complet : le front reste statique même avec une session WordPress.'
+                                    : 'L’administration, les prévisualisations et les URLs avec paramètres restent dynamiques.';
+                            }
+                        }
                     }
 
                     select.addEventListener('change', function() {
                         var mode = select.value;
                         select.disabled = true;
                         syncAlwaysRegen();
+                        if (loggedInInput) {
+                            loggedInInput.disabled = true;
+                        }
 
                         var body = new URLSearchParams();
                         body.append('action', 'wp_static_toggle_auto');
@@ -1253,6 +1362,9 @@ function wp_static_admin_page_content()
                             .then(function(data) {
                                 if (data && data.success) {
                                     previous = data.data.mode;
+                                    if (loggedInInput) {
+                                        loggedInInput.dataset.stored = data.data.serve_logged_in_stored ? '1' : '0';
+                                    }
                                 } else {
                                     throw new Error('save_failed');
                                 }
@@ -1263,6 +1375,64 @@ function wp_static_admin_page_content()
                             })
                             .finally(function() {
                                 select.disabled = false;
+                                syncAlwaysRegen();
+                            });
+                    });
+                })();
+            </script>
+            <script>
+                (function() {
+                    var input = document.getElementById('wp-static-serve-logged-in');
+                    var status = document.getElementById('wp-static-serve-logged-in-status');
+                    var mode = document.getElementById('wp-static-mode');
+                    if (!input) {
+                        return;
+                    }
+                    var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+                    var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_static_toggle_action')); ?>;
+
+                    input.addEventListener('change', function() {
+                        var previous = input.dataset.stored === '1';
+                        var enabled = input.checked;
+                        input.disabled = true;
+                        status.textContent = 'Enregistrement…';
+
+                        var body = new URLSearchParams();
+                        body.append('action', 'wp_static_toggle_serve_logged_in');
+                        body.append('nonce', nonce);
+                        body.append('enabled', enabled ? '1' : '0');
+
+                        fetch(ajaxUrl, {
+                                method: 'POST',
+                                credentials: 'same-origin',
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded'
+                                },
+                                body: body.toString()
+                            })
+                            .then(function(r) {
+                                return r.json();
+                            })
+                            .then(function(data) {
+                                if (!data || !data.success) {
+                                    throw new Error('save_failed');
+                                }
+                                input.dataset.stored = data.data.stored ? '1' : '0';
+                                input.checked = data.data.enabled;
+                                status.textContent = data.data.enabled
+                                    ? 'Statique activé pour les utilisateurs connectés.'
+                                    : 'Rendu dynamique conservé pour les utilisateurs connectés.';
+                                if (data.data.warning) {
+                                    status.textContent += ' ' + data.data.warning;
+                                }
+                            })
+                            .catch(function() {
+                                input.dataset.stored = previous ? '1' : '0';
+                                input.checked = previous;
+                                status.textContent = 'Erreur lors de l’enregistrement.';
+                            })
+                            .finally(function() {
+                                input.disabled = mode && mode.value === 'full';
                             });
                     });
                 })();
@@ -1590,6 +1760,45 @@ function wp_static_admin_page_content()
                     });
                 })();
             </script>
+            <?php if (is_array($last_generation)) : ?>
+                <?php
+                $completed_at = (int) $last_generation['completed_at'];
+                $date_format = trim((string) get_option('date_format') . ' ' . (string) get_option('time_format'));
+                $completed_label = $completed_at > 0
+                    ? wp_date($date_format !== '' ? $date_format : 'd/m/Y H:i:s', $completed_at)
+                    : '—';
+                $duration_label = number_format_i18n((float) $last_generation['duration'], 2);
+                $details = array_values(array_filter(
+                    $last_generation['messages'],
+                    static function ($message) {
+                        return is_scalar($message) && trim((string) $message) !== '';
+                    }
+                ));
+                ?>
+                <div class="wp-static-last-generation">
+                    <h3>Dernière génération complète</h3>
+                    <p>
+                        <strong><?php echo esc_html($completed_label); ?></strong>
+                        — <?php echo esc_html($duration_label); ?> seconde(s)
+                        — minification <?php echo !empty($last_generation['minified']) ? 'activée' : 'désactivée'; ?>
+                    </p>
+                    <ul>
+                        <li><strong><?php echo esc_html($last_generation['generated']); ?></strong> générée(s)</li>
+                        <li><strong><?php echo esc_html($last_generation['skipped']); ?></strong> ignorée(s)</li>
+                        <li><strong><?php echo esc_html($last_generation['failed']); ?></strong> en erreur</li>
+                    </ul>
+                    <?php if ($details !== []) : ?>
+                        <details>
+                            <summary>Détails des URLs (<?php echo esc_html(count($details)); ?>)</summary>
+                            <ul>
+                                <?php foreach ($details as $message) : ?>
+                                    <li><?php echo esc_html((string) $message); ?></li>
+                                <?php endforeach; ?>
+                            </ul>
+                        </details>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
             <br>
             <hr>
 
@@ -2264,6 +2473,37 @@ function wp_static_ajax_toggle_minify()
 }
 
 /**
+ * Autorise / refuse le cache statique pour le cookie de connexion WordPress.
+ * Le mode Complet force ce comportement sans écraser la préférence mémorisée.
+ */
+function wp_static_ajax_toggle_serve_logged_in()
+{
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_static_toggle_action', 'nonce');
+
+    $mode = wp_static_get_mode();
+    if ($mode !== 'full') {
+        $enabled = (isset($_POST['enabled']) && $_POST['enabled'] === '1') ? 1 : 0;
+        update_option(WP_STATIC_SERVE_LOGGED_IN_OPTION, $enabled, false);
+    }
+
+    $warning = '';
+    if (wp_static_is_enabled() && !wp_static_inject_index()) {
+        $warning = 'Réglage enregistré, mais index.php n’a pas pu être actualisé. Le fallback WordPress appliquera tout de même le réglage.';
+    }
+
+    wp_send_json_success([
+        'enabled' => wp_static_should_serve_logged_in($mode),
+        'stored' => wp_static_serve_logged_in_preference(),
+        'forced' => $mode === 'full',
+        'warning' => $warning,
+    ]);
+}
+
+/**
  * Active / désactive la purge des fichiers orphelins (AJAX).
  */
 function wp_static_ajax_toggle_purge_orphans()
@@ -2299,7 +2539,11 @@ function wp_static_ajax_toggle_auto()
 
     $mode = wp_static_set_mode($mode);
 
-    wp_send_json_success(['mode' => $mode]);
+    wp_send_json_success([
+        'mode' => $mode,
+        'serve_logged_in' => wp_static_should_serve_logged_in($mode),
+        'serve_logged_in_stored' => wp_static_serve_logged_in_preference(),
+    ]);
 }
 
 /**
@@ -4340,6 +4584,55 @@ function wp_static_add_result_message(&$result, $message, $is_error = false)
     }
 }
 
+function wp_static_get_last_generation_result()
+{
+    $result = get_option(WP_STATIC_LAST_RESULT_OPTION, null);
+    if (!is_array($result)) {
+        return null;
+    }
+
+    $result = wp_parse_args($result, [
+        'completed_at' => 0,
+        'duration' => 0,
+        'generated' => 0,
+        'skipped' => 0,
+        'failed' => 0,
+        'messages' => [],
+        'errors' => [],
+        'minified' => false,
+    ]);
+
+    $result['completed_at'] = max(0, (int) $result['completed_at']);
+    $result['duration'] = max(0, (float) $result['duration']);
+    $result['generated'] = max(0, (int) $result['generated']);
+    $result['skipped'] = max(0, (int) $result['skipped']);
+    $result['failed'] = max(0, (int) $result['failed']);
+    $result['messages'] = is_array($result['messages']) ? $result['messages'] : [];
+    $result['errors'] = is_array($result['errors']) ? $result['errors'] : [];
+    $result['minified'] = !empty($result['minified']);
+
+    return $result;
+}
+
+function wp_static_store_last_generation_result($result, $started_at)
+{
+    $result = wp_parse_args(is_array($result) ? $result : [], [
+        'generated' => 0,
+        'skipped' => 0,
+        'failed' => 0,
+        'messages' => [],
+        'errors' => [],
+    ]);
+
+    $result['completed_at'] = time();
+    $result['duration'] = round(max(0, microtime(true) - (float) $started_at), 3);
+    $result['minified'] = wp_static_is_minify_enabled();
+
+    update_option(WP_STATIC_LAST_RESULT_OPTION, $result, false);
+
+    return $result;
+}
+
 /**
  * Génération complète : régénère tout le site et reconstruit la carte des
  * dépendances depuis zéro.
@@ -4374,25 +4667,27 @@ function wp_static_do_full_generation()
 
 function wp_static_run_generation()
 {
+    $started_at = microtime(true);
+
     if (wp_static_preprod_credentials_missing()) {
         wp_static_mark_dirty();
 
-        return [
+        return wp_static_store_last_generation_result([
             'generated' => 0,
             'skipped' => 0,
             'failed' => 1,
             'messages' => ['Génération impossible : identifiants Basic Auth manquants en préproduction.'],
             'errors' => ['Génération impossible : identifiants Basic Auth manquants en préproduction.'],
-        ];
+        ], $started_at);
     }
 
     if (!file_exists(WP_STATIC_DIR) && !wp_mkdir_p(WP_STATIC_DIR)) {
-        return [
+        return wp_static_store_last_generation_result([
             'generated' => 0,
             'skipped' => 0,
             'failed' => 1,
             'messages' => ['Impossible de créer le dossier statique : ' . WP_STATIC_DIR],
-        ];
+        ], $started_at);
     }
 
     try {
@@ -4401,13 +4696,13 @@ function wp_static_run_generation()
         wp_static_add_pending_regen([], true);
         wp_static_mark_dirty();
 
-        return [
+        return wp_static_store_last_generation_result([
             'generated' => 0,
             'skipped' => 0,
             'failed' => 1,
             'messages' => ['La génération a été interrompue et replacée en file d’attente.'],
             'errors' => [$error->getMessage()],
-        ];
+        ], $started_at);
     }
 
     if ($result === false) {
@@ -4429,7 +4724,7 @@ function wp_static_run_generation()
         ];
     }
 
-    return $result;
+    return wp_static_store_last_generation_result($result, $started_at);
 }
 
 /**
@@ -5287,7 +5582,7 @@ function wp_static_serve_static_page()
         return;
     }
 
-    if (wp_static_request_has_private_cookie()) {
+    if (wp_static_request_has_private_cookie(null, wp_static_should_serve_logged_in())) {
         return;
     }
 
@@ -5368,15 +5663,15 @@ function wp_static_serve_static_page()
 }
 
 /**
- * Les pages personnalisées par WordPress ne doivent jamais être servies depuis
- * le cache statique. Le paramètre facilite les contrats sans modifier $_COOKIE.
+ * Détecte les cookies qui imposent un rendu dynamique. Le cookie de connexion
+ * peut être autorisé, contrairement aux commentaires et pages protégées.
  */
-function wp_static_request_has_private_cookie($cookies = null)
+function wp_static_request_has_private_cookie($cookies = null, $serve_logged_in = false)
 {
     $cookies = is_array($cookies) ? $cookies : $_COOKIE;
     foreach (array_keys($cookies) as $cookie_name) {
         if (
-            strpos($cookie_name, 'wordpress_logged_in') === 0
+            (!$serve_logged_in && strpos($cookie_name, 'wordpress_logged_in') === 0)
             || strpos($cookie_name, 'comment_author') === 0
             || strpos($cookie_name, 'wp-postpass') === 0
         ) {
@@ -5435,6 +5730,7 @@ function wp_static_index_snippet()
     $end      = WP_STATIC_INDEX_MARKER_END;
     $service  = var_export(wp_static_pre_wp_file_relative(), true);
     $base_rel = var_export(wp_static_static_dir_relative(), true);
+    $serve_logged_in = wp_static_should_serve_logged_in() ? 'true' : 'false';
 
     return <<<PHP
 {$start}
@@ -5445,7 +5741,7 @@ function wp_static_index_snippet()
 if (is_file(\$wpsc_service)) {
     require_once \$wpsc_service;
     if (function_exists('wp_static_serve_pre_wp')) {
-        wp_static_serve_pre_wp(__DIR__ . '/' . {$base_rel});
+        wp_static_serve_pre_wp(__DIR__ . '/' . {$base_rel}, {$serve_logged_in});
     }
 }
 {$end}

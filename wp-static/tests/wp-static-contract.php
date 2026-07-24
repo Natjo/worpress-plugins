@@ -30,16 +30,84 @@ if (
     $failures[] = 'La minification modifie les espaces utiles ou conserve les commentaires.';
 }
 
+$previousLastGeneration = get_option(WP_STATIC_LAST_RESULT_OPTION, null);
+$storedGeneration = wp_static_store_last_generation_result([
+    'generated' => 3,
+    'skipped' => 1,
+    'failed' => 0,
+    'messages' => ['Page générée : https://example.test/'],
+], microtime(true) - 1);
+$lastGeneration = wp_static_get_last_generation_result();
+if (
+    $storedGeneration['generated'] !== 3
+    || !is_array($lastGeneration)
+    || $lastGeneration['generated'] !== 3
+    || $lastGeneration['skipped'] !== 1
+    || $lastGeneration['failed'] !== 0
+    || $lastGeneration['duration'] < 0.9
+    || $lastGeneration['completed_at'] <= 0
+    || $lastGeneration['messages'] !== ['Page générée : https://example.test/']
+) {
+    $failures[] = 'Le résultat persistant de la dernière génération est incomplet.';
+}
+if ($previousLastGeneration === null) {
+    delete_option(WP_STATIC_LAST_RESULT_OPTION);
+} else {
+    update_option(WP_STATIC_LAST_RESULT_OPTION, $previousLastGeneration, false);
+}
+
 if (
     !wp_static_request_has_private_cookie(['wordpress_logged_in_contract' => '1'])
     || !wp_static_request_has_private_cookie(['comment_author_contract' => '1'])
     || !wp_static_request_has_private_cookie(['wp-postpass_contract' => '1'])
+    || wp_static_request_has_private_cookie(['wordpress_logged_in_contract' => '1'], true)
+    || !wp_static_request_has_private_cookie(['comment_author_contract' => '1'], true)
+    || !wp_static_request_has_private_cookie(['wp-postpass_contract' => '1'], true)
     || wp_static_request_has_private_cookie(['contract_public' => '1'])
 ) {
     $failures[] = 'Les cookies privés WordPress ne sont pas correctement détectés.';
 }
 
 require_once WP_PLUGIN_DIR . '/wp-static/pre-wp-cache.php';
+if (
+    !wp_static_pre_wp_has_private_cookie(['wordpress_logged_in_contract' => '1'])
+    || wp_static_pre_wp_has_private_cookie(['wordpress_logged_in_contract' => '1'], true)
+    || !wp_static_pre_wp_has_private_cookie(['comment_author_contract' => '1'], true)
+    || !wp_static_pre_wp_has_private_cookie(['wp-postpass_contract' => '1'], true)
+) {
+    $failures[] = 'Le service pré-WordPress ne respecte pas le réglage des utilisateurs connectés.';
+}
+
+$previousServeLoggedIn = get_option(WP_STATIC_SERVE_LOGGED_IN_OPTION, null);
+$previousServeLoggedInMode = get_option(WP_STATIC_MODE_OPTION, null);
+delete_option(WP_STATIC_SERVE_LOGGED_IN_OPTION);
+update_option(WP_STATIC_MODE_OPTION, 'auto');
+$autoSnippet = wp_static_index_snippet();
+update_option(WP_STATIC_SERVE_LOGGED_IN_OPTION, 1, false);
+$enabledSnippet = wp_static_index_snippet();
+delete_option(WP_STATIC_SERVE_LOGGED_IN_OPTION);
+update_option(WP_STATIC_MODE_OPTION, 'full');
+$fullSnippet = wp_static_index_snippet();
+if (
+    wp_static_should_serve_logged_in('auto')
+    || !wp_static_should_serve_logged_in('full')
+    || strpos($autoSnippet, "wp_static_serve_pre_wp(__DIR__ . '/' . 'wp-content/static-pages', false);") === false
+    || strpos($enabledSnippet, "wp_static_serve_pre_wp(__DIR__ . '/' . 'wp-content/static-pages', true);") === false
+    || strpos($fullSnippet, "wp_static_serve_pre_wp(__DIR__ . '/' . 'wp-content/static-pages', true);") === false
+) {
+    $failures[] = 'Le mode Complet ne force pas correctement le statique pour les utilisateurs connectés.';
+}
+if ($previousServeLoggedIn === null) {
+    delete_option(WP_STATIC_SERVE_LOGGED_IN_OPTION);
+} else {
+    update_option(WP_STATIC_SERVE_LOGGED_IN_OPTION, $previousServeLoggedIn, false);
+}
+if ($previousServeLoggedInMode === null) {
+    delete_option(WP_STATIC_MODE_OPTION);
+} else {
+    update_option(WP_STATIC_MODE_OPTION, $previousServeLoggedInMode, false);
+}
+
 $generationToken = wp_static_start_generation_token();
 if (
     $generationToken === ''

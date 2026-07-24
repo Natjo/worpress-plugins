@@ -28,6 +28,26 @@ if (!function_exists('wp_static_pre_wp_valid_generation_token')) {
     }
 }
 
+if (!function_exists('wp_static_pre_wp_has_private_cookie')) {
+    /**
+     * Les cookies de commentaire et de page protégée restent toujours privés.
+     * Le cookie de connexion peut être ignoré explicitement pour les petits
+     * sites servis intégralement en statique.
+     */
+    function wp_static_pre_wp_has_private_cookie($cookies, $serve_logged_in = false) {
+        $cookies = is_array($cookies) ? $cookies : array();
+        foreach (array_keys($cookies) as $cookie_name) {
+            if ((!$serve_logged_in && strpos($cookie_name, 'wordpress_logged_in') === 0)
+                || strpos($cookie_name, 'comment_author') === 0
+                || strpos($cookie_name, 'wp-postpass') === 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
 if (!function_exists('wp_static_serve_pre_wp')) {
     /**
      * Sert le fichier statique correspondant à l'URL courante puis arrête le
@@ -36,8 +56,9 @@ if (!function_exists('wp_static_serve_pre_wp')) {
      * mise en cache.
      *
      * @param string $base_dir Dossier racine des pages statiques (chemin absolu).
+     * @param bool   $serve_logged_in Autorise le statique malgré le cookie de connexion.
      */
-    function wp_static_serve_pre_wp($base_dir) {
+    function wp_static_serve_pre_wp($base_dir, $serve_logged_in = false) {
         // Uniquement les requêtes GET, sans chaîne de requête.
         if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'GET') {
             return;
@@ -71,14 +92,10 @@ if (!function_exists('wp_static_serve_pre_wp')) {
             return;
         }
 
-        // Jamais pour un utilisateur connecté (ou ayant commenté / saisi un mot
-        // de passe de page protégée) : il doit voir le rendu dynamique.
-        foreach (array_keys($_COOKIE) as $cookie_name) {
-            if (strpos($cookie_name, 'wordpress_logged_in') === 0
-                || strpos($cookie_name, 'comment_author') === 0
-                || strpos($cookie_name, 'wp-postpass') === 0) {
-                return;
-            }
+        // Les pages protégées et les sessions de commentaire restent
+        // dynamiques. Le mode Complet peut autoriser le cookie de connexion.
+        if (wp_static_pre_wp_has_private_cookie($_COOKIE, $serve_logged_in)) {
+            return;
         }
 
         $real_base = realpath($base_dir);

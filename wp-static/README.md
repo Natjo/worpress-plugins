@@ -71,6 +71,14 @@ Dans l'onglet **Paramètres**, un menu **« Mode de régénération »** propose
 - **Automatique (ciblé)** *(par défaut)* : seules les **pages impactées** sont régénérées à chaque modification de contenu (comportement décrit dans [Mise à jour automatique](#mise-à-jour-automatique)). Recommandé pour la plupart des sites.
 - **Complet** : l'**intégralité du site** est régénérée à **chaque** événement automatique qui affecte le front public (sauvegarde d'un contenu publié, publication, suppression, commentaire, terme…). Les boutons **Régénérer** par ligne restent ciblés. Simple et toujours à jour, idéal pour les **petits sites** au contenu peu changeant — à éviter sur les gros sites car le coût croît avec le nombre de pages.
 
+La case **« Servir le site statique aux utilisateurs connectés »** contrôle le
+cookie de connexion WordPress dans les modes Manuel et Automatique. En mode
+**Complet**, elle est activée de force et désactivée dans l’interface : le front
+reste statique même lorsque l’administrateur est connecté. `/wp-admin`, la
+connexion, les prévisualisations et toutes les URLs avec paramètres restent
+dynamiques. Les cookies de commentaire et de page protégée (`comment_author`,
+`wp-postpass`) continuent toujours à contourner le cache.
+
 > Les deux champs ci-dessous (URLs forcées et classes) ainsi que la colonne « Dépend de » du tableau ne s'affichent qu'en mode **Automatique (ciblé)** : ils sont inutiles en mode Manuel (rien d'auto) comme en mode Complet (tout est déjà régénéré).
 
 En mode **Automatique (ciblé)**, deux champs permettent de couvrir les pages que la carte de dépendances ne peut pas deviner (accueil « magazine », plan du site, listing à requête personnalisée…). Les URLs « non statique »/exclues sont ignorées à la génération.
@@ -115,6 +123,11 @@ explicitement l’utilisateur et le mot de passe stockés.
 ### 2. Génération
 
 Un bouton **« Générer les pages statiques »** lance une génération complète du site et reconstruit la carte des dépendances. Une notice récapitule le nombre de pages générées / ignorées / en erreur.
+
+Le bloc **« Dernière génération complète »** conserve ce résultat au-delà de
+la notice temporaire : date et heure, durée, état de la minification, compteurs
+et détail des URLs traitées. Une demande seulement placée en file d’attente
+n’écrase pas le dernier résultat réellement terminé.
 
 Le bouton **« Vider le cache statique »** supprime tous les fichiers générés et vide la carte des dépendances. WordPress sert alors les pages dynamiquement jusqu'à la prochaine génération.
 
@@ -208,11 +221,14 @@ $wpsc_service = __DIR__ . '/' . 'wp-content/plugins/wp-static/pre-wp-cache.php';
 if (is_file($wpsc_service)) {
     require_once $wpsc_service;
     if (function_exists('wp_static_serve_pre_wp')) {
-        wp_static_serve_pre_wp(__DIR__ . '/' . 'wp-content/static-pages');
+        wp_static_serve_pre_wp(__DIR__ . '/' . 'wp-content/static-pages', false);
     }
 }
 /* wp-static-cache:end */
 ```
+
+Le second argument est réinjecté automatiquement à `true` lorsque le réglage
+l’autorise ou lorsque le mode Complet le force.
 
 - Activé via le toggle **« Activer le site statique »** : le bloc est inséré entre les marqueurs `/* wp-static-cache:start */` … `/* wp-static-cache:end */`.
 - Désactivé : le bloc est retiré automatiquement (et aussi à la **désactivation du plugin**).
@@ -223,9 +239,10 @@ Garde-fous du bloc injecté :
 
 - uniquement les requêtes **GET**, **sans chaîne de requête** ;
 - jamais pour `/wp-admin`, `/wp-login`, `/wp-json`, `/wp-cron`, `/xmlrpc` ;
-- jamais pour un **utilisateur connecté** ou une page personnalisée par un cookie
-  (`wordpress_logged_in`, `comment_author`, `wp-postpass`), aussi bien dans le
-  service pré-WordPress que dans son fallback WordPress ;
+- le cookie `wordpress_logged_in` contourne le cache selon l’option dédiée, sauf
+  en mode Complet où le front statique est toujours servi ;
+- jamais pour une page personnalisée par `comment_author` ou `wp-postpass`,
+  aussi bien dans le service pré-WordPress que dans son fallback WordPress ;
 - jamais pendant une **génération** lorsque l’en-tête `X-WP-Static-Token`
   correspond au jeton temporaire privé écrit par le plugin ; un en-tête forgé
   ne force plus le chargement de WordPress ;
@@ -244,7 +261,11 @@ Garde-fous du bloc injecté :
 
 Le service PHP décrit ci‑dessus économise le rendu mais charge quand même WordPress. Pour servir les fichiers **sans démarrer PHP**, faites pointer le serveur web vers le dossier `wp-content/static-pages`. Les fichiers y sont rangés en miroir de l'URL : `/contact/` → `wp-content/static-pages/contact/index.html`.
 
-> Important : ces règles servent le statique à **tout le monde**. Pour éviter de servir une page en cache aux utilisateurs connectés ou aux requêtes POST, on restreint au `GET`, hors `wp-admin`, sans chaîne de requête et sans cookie de connexion. C'est un point de départ à adapter.
+> Important : ces exemples de configuration serveur ne peuvent pas lire le mode
+> stocké dans WordPress. Ils conservent donc par défaut le rendu dynamique pour
+> les utilisateurs connectés. Pour reproduire le mode Complet du plugin,
+> retirez uniquement la condition `wordpress_logged_in` ; conservez les gardes
+> sur la méthode, les paramètres et l’administration.
 
 ### nginx
 
@@ -571,6 +592,27 @@ add_filter( 'wp_static_urls', function ( $urls ) {
 ---
 
 ## Notes de version
+
+### 1.2.3 — 24 juillet 2026
+
+- Correction de l’affichage des interrupteurs désactivés dans l’administration :
+  le champ natif reste entièrement masqué et ne produit plus de trait parasite.
+
+### 1.2.2 — 24 juillet 2026
+
+- Ajout du réglage permettant de servir le statique aux utilisateurs connectés
+  dans les modes Manuel et Automatique.
+- En mode Complet, le front statique est désormais forcé pour les utilisateurs
+  connectés, directement depuis le service pré-WordPress ; l’administration,
+  les prévisualisations, les URLs avec paramètres et les cookies réellement
+  privés restent dynamiques.
+
+### 1.2.1 — 24 juillet 2026
+
+- Ajout d’un résultat persistant pour la dernière génération complète : date,
+  durée, minification, compteurs et détail des URLs.
+- Ajout d’un rappel d’état du cache public avec l’en-tête
+  `X-Static-Cache: HIT-PRE-WP`.
 
 ### 1.2.0 — 23 juillet 2026
 
