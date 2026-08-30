@@ -63,8 +63,9 @@ if (!function_exists('wp_static_serve_pre_wp')) {
         if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'GET') {
             return;
         }
-        // Requête de génération : le jeton doit aussi correspondre au fichier
-        // temporaire écrit par le plugin. Un simple en-tête forgé ne suffit pas.
+        // Requête de génération : le jeton doit correspondre au fichier temporaire
+        // écrit par le plugin. Un jeton présent mais invalide ne doit jamais
+        // servir une page statique obsolète : on laisse WordPress répondre.
         if (!empty($_SERVER['HTTP_X_WP_STATIC_TOKEN'])) {
             if (wp_static_pre_wp_valid_generation_token(
                 $base_dir,
@@ -72,6 +73,8 @@ if (!function_exists('wp_static_serve_pre_wp')) {
             )) {
                 return;
             }
+
+            return;
         }
         if (!empty($_SERVER['QUERY_STRING'])) {
             return;

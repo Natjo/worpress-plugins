@@ -3,7 +3,7 @@
 /**
  * Plugin Name: WP Static
  * Description: Génère des pages statiques de votre site WordPress et les sert pour améliorer les performances.
- * Version: 1.2.3
+ * Version: 1.2.4
  * Author: Lonsdale studio
  */
 
@@ -37,6 +37,9 @@ define('WP_STATIC_GEN_LOCK_FILE', WP_CONTENT_DIR . '/wp-static-generating.lock')
 define('WP_STATIC_PENDING_LOCK_FILE', WP_CONTENT_DIR . '/wp-static-pending.lock');
 define('WP_STATIC_GEN_PENDING_OPTION', 'wp_static_gen_pending');
 define('WP_STATIC_PENDING_CRON_HOOK', 'wp_static_process_pending_regeneration');
+define('WP_STATIC_BATCH_JOB_OPTION', 'wp_static_batch_job');
+define('WP_STATIC_BATCH_SIZE', 1);
+define('WP_STATIC_ERROR_PAGE_PATH', 'wp-static/error/404');
 
 /**
  * Liste des URLs explicitement exclues du statique (servies en dynamique).
@@ -302,7 +305,7 @@ function wp_static_is_minify_enabled()
 
 /**
  * Préférence enregistrée pour le service statique aux utilisateurs connectés.
- * En mode Complet, le comportement effectif est forcé sans écraser ce choix.
+ * En mode Full, le comportement effectif est forcé sans écraser ce choix.
  */
 function wp_static_serve_logged_in_preference()
 {
@@ -319,8 +322,8 @@ function wp_static_should_serve_logged_in($mode = null)
 /**
  * Mode de régénération :
  * - 'manual' : rien n'est régénéré automatiquement, le site est marqué « à régénérer » ;
- * - 'auto'   : seules les pages impactées sont régénérées (dépendances, listings, classes…) ;
- * - 'full'   : l'intégralité du site est régénérée à chaque événement (petits sites).
+ * - 'auto'   : automatique — seules les pages impactées sont régénérées (dépendances, listings, classes…) ;
+ * - 'full'   : full — l'intégralité du site est régénérée à chaque événement (petits sites).
  */
 function wp_static_get_mode()
 {
@@ -489,7 +492,7 @@ function wp_static_mark_dirty()
 
 /**
  * Réaction à un changement structurel dont l'impact est difficile à cibler.
- * En mode Complet : régénère l'intégralité du site. Sinon : marque « à régénérer ».
+ * En mode Full : régénère l'intégralité du site. Sinon : marque « à régénérer ».
  */
 function wp_static_on_structural_change()
 {
@@ -619,10 +622,12 @@ add_action('wp_ajax_wp_static_toggle_purge_orphans', 'wp_static_ajax_toggle_purg
 add_action('wp_ajax_wp_static_toggle_auto', 'wp_static_ajax_toggle_auto');
 add_action('wp_ajax_wp_static_save_htaccess', 'wp_static_ajax_save_htaccess');
 add_action('wp_ajax_wp_static_save_advanced', 'wp_static_ajax_save_advanced');
-add_action('wp_ajax_wp_static_save_always_regen', 'wp_static_ajax_save_always_regen');
 add_action('wp_ajax_wp_static_clear_cache', 'wp_static_ajax_clear_cache');
 add_action('wp_ajax_wp_static_regenerate_url', 'wp_static_ajax_regenerate_url');
 add_action('wp_ajax_wp_static_toggle_exclude', 'wp_static_ajax_toggle_exclude');
+add_action('wp_ajax_wp_static_batch_start', 'wp_static_ajax_batch_start');
+add_action('wp_ajax_wp_static_batch_step', 'wp_static_ajax_batch_step');
+add_action('wp_ajax_wp_static_batch_cancel', 'wp_static_ajax_batch_cancel');
 
 // Régénération automatique du contenu modifié et de ses pages dépendantes.
 add_action('save_post', 'wp_static_on_save_post', 20, 3);
@@ -726,6 +731,7 @@ function wp_static_admin_page_content()
     $static_enabled = wp_static_is_enabled();
     $needs_initial_generation = $static_enabled && !wp_static_has_generated_pages();
     $last_generation = wp_static_get_last_generation_result();
+    $active_batch = wp_static_get_batch_job();
     $result_transient = WP_STATIC_RESULT_TRANSIENT_PREFIX . get_current_user_id();
     $result = get_transient($result_transient);
     delete_transient($result_transient);
@@ -739,36 +745,69 @@ function wp_static_admin_page_content()
         ]);
     }
     $notice_type = is_array($result) && $result['failed'] > 0 ? 'warning' : 'success';
+    $show_dirty_notice = $static_enabled && wp_static_is_dirty();
 ?>
     <div class="wrap">
-        <?php if (is_array($result)) : ?>
-            <div id="wp-static-notice-slot" class="wp-static-notice-slot">
-                <div class="wp-static-result-notice wp-static-result-notice--<?php echo esc_attr($notice_type); ?> is-dismissible" role="alert">
-                    <p>
-                        <strong>Génération terminée.</strong>
-                        <?php echo esc_html($result['generated']); ?> page(s) générée(s),
-                        <?php echo esc_html($result['skipped']); ?> page(s) ignorée(s),
-                        <?php echo esc_html($result['failed']); ?> erreur(s).
+        <div class="wp-static-notices">
+            <?php if ($show_dirty_notice) : ?>
+                <div class="notice notice-error inline">
+                    <p style="color:#d63638;">
+                        <strong>WP Static :</strong>
+                        des changements de structure (menu, permaliens ou réglages) ont été détectés.
+                        Le site statique est peut-être obsolète.
+                        <a href="#statique"><strong>Régénérer le site</strong></a>.
                     </p>
-                    <?php if (!empty($result['errors'])) : ?>
-                        <ul>
-                            <?php foreach (array_slice($result['errors'], 0, 10) as $error) : ?>
-                                <li><?php echo esc_html($error); ?></li>
-                            <?php endforeach; ?>
-                        </ul>
-                    <?php endif; ?>
-                    <button type="button" class="notice-dismiss">
-                        <span class="screen-reader-text"><?php esc_html_e('Dismiss this notice.'); ?></span>
-                    </button>
                 </div>
+            <?php endif; ?>
+            <?php if ($preprod_credentials_missing) : ?>
+                <div class="notice notice-error inline">
+                    <p>
+                        <strong>Authentification préproduction non configurée.</strong>
+                        Renseignez l’utilisateur et le mot de passe dans l’onglet
+                        <a href="#parametres">Paramètres</a> avant de lancer une génération.
+                    </p>
+                </div>
+            <?php endif; ?>
+            <?php if (is_array($result)) : ?>
+                <div id="wp-static-notice-slot" class="wp-static-notice-slot">
+                    <div class="wp-static-result-notice wp-static-result-notice--<?php echo esc_attr($notice_type); ?> is-dismissible" role="alert">
+                        <p>
+                            <strong>Génération terminée.</strong>
+                            <?php echo esc_html($result['generated']); ?> page(s) générée(s),
+                            <?php echo esc_html($result['skipped']); ?> page(s) ignorée(s),
+                            <?php echo esc_html($result['failed']); ?> erreur(s).
+                        </p>
+                        <?php if (!empty($result['errors'])) : ?>
+                            <ul>
+                                <?php foreach (array_slice($result['errors'], 0, 10) as $error) : ?>
+                                    <li><?php echo esc_html($error); ?></li>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php endif; ?>
+                        <button type="button" class="notice-dismiss">
+                            <span class="screen-reader-text"><?php esc_html_e('Dismiss this notice.'); ?></span>
+                        </button>
+                    </div>
+                </div>
+            <?php endif; ?>
+            <div
+                id="wp-static-empty-cache-notice"
+                class="notice notice-warning inline"
+                <?php echo $needs_initial_generation ? '' : ' style="display:none;"'; ?>
+            >
+                <p>
+                    <strong>Aucune page statique n’a encore été générée.</strong>
+                    WordPress continue à servir le site jusqu’à la première génération.
+                    <a href="#statique" class="button button-primary">Générer les pages statiques</a>
+                </p>
             </div>
-        <?php endif; ?>
+        </div>
         <?php
         $mode = wp_static_get_mode();
         $mode_badges = [
             'manual' => 'Mode manuel',
             'auto'   => 'Mode automatique',
-            'full'   => 'Mode complet',
+            'full'   => 'Mode full',
         ];
         $badge_label = isset($mode_badges[$mode]) ? $mode_badges[$mode] : $mode_badges['auto'];
         $mode_descriptions = [
@@ -794,32 +833,6 @@ function wp_static_admin_page_content()
                 </div>
             </div>
             <span id="wp-static-mode-badge" class="wp-static-mode-badge"><?php echo esc_html($badge_label); ?></span>
-            <p class="description" id="wp-static-mode-desc"><?php echo esc_html($mode_descriptions[$mode]); ?></p>
-            <p class="description">
-                En mode Complet, le front statique est également servi aux utilisateurs connectés.
-                Dans les autres modes, ce comportement dépend du réglage dédié.
-                Vérifiez l’en-tête <code>X-Static-Cache: HIT-PRE-WP</code>.
-            </p>
-        </div>
-        <?php if ($preprod_credentials_missing) : ?>
-            <div class="notice notice-error inline">
-                <p>
-                    <strong>Authentification préproduction non configurée.</strong>
-                    Renseignez l’utilisateur et le mot de passe dans l’onglet
-                    <a href="#parametres">Paramètres</a> avant de lancer une génération.
-                </p>
-            </div>
-        <?php endif; ?>
-        <div
-            id="wp-static-empty-cache-notice"
-            class="notice notice-warning inline"
-            <?php echo $needs_initial_generation ? '' : ' style="display:none;"'; ?>
-        >
-            <p>
-                <strong>Aucune page statique n’a encore été générée.</strong>
-                WordPress continue à servir le site jusqu’à la première génération.
-                <a href="#statique" class="button button-primary">Générer les pages statiques</a>
-            </p>
         </div>
         <?php if (is_array($result)) : ?>
         <script>
@@ -917,6 +930,18 @@ function wp_static_admin_page_content()
                 margin: 0 0 12px 0;
             }
 
+            .wp-static-notices {
+                margin: 8px 0 16px;
+            }
+
+            .wp-static-notices > .notice {
+                margin: 0 0 12px;
+            }
+
+            .wp-static-notices > .notice:last-child {
+                margin-bottom: 0;
+            }
+
             .wp-static-result-notice {
                 position: relative;
                 background: #fff;
@@ -1002,7 +1027,7 @@ function wp_static_admin_page_content()
             }
 
             #wp-static-mode-desc {
-                margin: 8px 0 0 0;
+                margin: 0;
                 max-width: 720px;
             }
 
@@ -1186,8 +1211,9 @@ function wp_static_admin_page_content()
                 <select id="wp-static-mode">
                     <option value="manual" <?php selected($wp_static_mode, 'manual'); ?>>Manuel</option>
                     <option value="auto" <?php selected($wp_static_mode, 'auto'); ?>>Automatique</option>
-                    <option value="full" <?php selected($wp_static_mode, 'full'); ?>>Complet</option>
+                    <option value="full" <?php selected($wp_static_mode, 'full'); ?>>Full</option>
                 </select>
+                <p class="description" id="wp-static-mode-desc"><?php echo esc_html($mode_descriptions[$wp_static_mode]); ?></p>
             </div>
             <?php
             $wp_static_serve_logged_in_preference = wp_static_serve_logged_in_preference();
@@ -1207,91 +1233,13 @@ function wp_static_admin_page_content()
                 </label>
                 <label for="wp-static-serve-logged-in">
                     Servir le site statique aux utilisateurs connectés.
+                    <span class="description">(L’administration, les prévisualisations et les URLs avec paramètres restent dynamiques.)</span>
                 </label>
                 <span class="wp-static-status" id="wp-static-serve-logged-in-status" aria-live="polite"></span>
             </div>
-            <p class="description" id="wp-static-serve-logged-in-desc" style="margin: -8px 0 16px 0;">
-                <?php if ($wp_static_serve_logged_in_forced) : ?>
-                    Activé automatiquement en mode Complet : le front reste statique même avec une session WordPress.
-                <?php else : ?>
-                    L’administration, les prévisualisations et les URLs avec paramètres restent dynamiques.
-                <?php endif; ?>
+            <p class="description" id="wp-static-serve-logged-in-desc" style="margin: -8px 0 16px 0;<?php echo $wp_static_serve_logged_in_forced ? '' : ' display: none;'; ?>">
+                Activé automatiquement en mode Full : le front reste statique même avec une session WordPress.
             </p>
-            <div id="wp-static-always-regen-wrap" <?php echo $wp_static_mode === 'auto' ? '' : ' style="display: none;"'; ?>>
-                <table class="form-table" role="presentation">
-                    <tr>
-                        <th scope="row"><label for="wp-static-always-regen">URLs à toujours régénérer</label></th>
-                        <td>
-                            <textarea id="wp-static-always-regen" rows="4" class="large-text code" placeholder="<?php echo esc_attr(home_url('/')); ?>&#10;/actualites/*"><?php echo esc_textarea((string) get_option(WP_STATIC_ALWAYS_REGEN_OPTION, '')); ?></textarea>
-                            <p class="description">Une entrée par ligne, régénérée à chaque enregistrement de contenu (en plus des pages détectées). Utile pour les pages que les dépendances ne devinent pas (accueil « magazine », plan du site, listing personnalisé…). Une ligne peut être une URL complète ou un motif avec joker <code>*</code> (ex. <code>/actualites/*</code>).</p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><label for="wp-static-regen-classes">Classes déclenchant une régénération</label></th>
-                        <td>
-                            <textarea id="wp-static-regen-classes" rows="3" class="large-text code" placeholder=".remontees-auto&#10;.bloc-actualites"><?php echo esc_textarea((string) get_option(WP_STATIC_REGEN_CLASSES_OPTION, '')); ?></textarea>
-                            <p class="description">Une classe CSS par ligne (ex. <code>.remontees-auto</code>). Toute page dont le HTML contient une de ces classes est détectée automatiquement à la génération et régénérée à chaque enregistrement de contenu — pas de mapping manuel.</p>
-                        </td>
-                    </tr>
-                </table>
-                <p>
-                    <button type="button" class="button" id="wp-static-always-regen-save">Enregistrer</button>
-                    <span class="wp-static-status" id="wp-static-always-regen-status" aria-live="polite"></span>
-                </p>
-            </div>
-            <script>
-                (function() {
-                    var ta = document.getElementById('wp-static-always-regen');
-                    var classesTa = document.getElementById('wp-static-regen-classes');
-                    var btn = document.getElementById('wp-static-always-regen-save');
-                    var status = document.getElementById('wp-static-always-regen-status');
-                    if (!ta || !btn) {
-                        return;
-                    }
-                    var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
-                    var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_static_toggle_action')); ?>;
-
-                    btn.addEventListener('click', function() {
-                        btn.disabled = true;
-                        status.textContent = 'Enregistrement…';
-
-                        var body = new URLSearchParams();
-                        body.append('action', 'wp_static_save_always_regen');
-                        body.append('nonce', nonce);
-                        body.append('always_regen', ta.value);
-                        body.append('regen_classes', classesTa ? classesTa.value : '');
-
-                        fetch(ajaxUrl, {
-                                method: 'POST',
-                                credentials: 'same-origin',
-                                headers: {
-                                    'Content-Type': 'application/x-www-form-urlencoded'
-                                },
-                                body: body.toString()
-                            })
-                            .then(function(r) {
-                                return r.json();
-                            })
-                            .then(function(data) {
-                                if (data && data.success) {
-                                    ta.value = data.data.value;
-                                    if (classesTa) {
-                                        classesTa.value = data.data.classes;
-                                    }
-                                    status.textContent = 'Enregistré (' + data.data.count + ' URL(s), ' + data.data.classes_count + ' classe(s)).';
-                                } else {
-                                    throw new Error('save_failed');
-                                }
-                            })
-                            .catch(function() {
-                                status.textContent = 'Erreur lors de l’enregistrement.';
-                            })
-                            .finally(function() {
-                                btn.disabled = false;
-                            });
-                    });
-                })();
-            </script>
             <script>
                 (function() {
                     var select = document.getElementById('wp-static-mode');
@@ -1300,13 +1248,16 @@ function wp_static_admin_page_content()
                     }
                     var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
                     var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_static_toggle_action')); ?>;
-                    var alwaysWrap = document.getElementById('wp-static-always-regen-wrap');
+                    var alwaysWrap = document.getElementById('wp-static-always-regen-fields');
                     var previous = select.value;
+                    // Mode ayant servi à rendre le tableau (colonne « Dépend de », etc.).
+                    window.wpStaticListMode = window.wpStaticListMode || previous;
+                    window.wpStaticCurrentMode = previous;
                     var badge = document.getElementById('wp-static-mode-badge');
                     var badgeText = {
                         manual: 'Mode manuel',
                         auto: 'Mode automatique',
-                        full: 'Mode complet'
+                        full: 'Mode full'
                     };
                     var desc = document.getElementById('wp-static-mode-desc');
                     var descText = <?php echo wp_json_encode($mode_descriptions); ?>;
@@ -1328,9 +1279,7 @@ function wp_static_admin_page_content()
                             loggedInInput.checked = forced || loggedInInput.dataset.stored === '1';
                             loggedInInput.disabled = forced;
                             if (loggedInDesc) {
-                                loggedInDesc.textContent = forced
-                                    ? 'Activé automatiquement en mode Complet : le front reste statique même avec une session WordPress.'
-                                    : 'L’administration, les prévisualisations et les URLs avec paramètres restent dynamiques.';
+                                loggedInDesc.style.display = forced ? '' : 'none';
                             }
                         }
                     }
@@ -1345,6 +1294,7 @@ function wp_static_admin_page_content()
 
                         var body = new URLSearchParams();
                         body.append('action', 'wp_static_toggle_auto');
+
                         body.append('nonce', nonce);
                         body.append('mode', mode);
 
@@ -1362,6 +1312,7 @@ function wp_static_admin_page_content()
                             .then(function(data) {
                                 if (data && data.success) {
                                     previous = data.data.mode;
+                                    window.wpStaticCurrentMode = previous;
                                     if (loggedInInput) {
                                         loggedInInput.dataset.stored = data.data.serve_logged_in_stored ? '1' : '0';
                                     }
@@ -1371,6 +1322,7 @@ function wp_static_admin_page_content()
                             })
                             .catch(function() {
                                 select.value = previous;
+                                window.wpStaticCurrentMode = previous;
                                 syncAlwaysRegen();
                             })
                             .finally(function() {
@@ -1419,12 +1371,7 @@ function wp_static_admin_page_content()
                                 }
                                 input.dataset.stored = data.data.stored ? '1' : '0';
                                 input.checked = data.data.enabled;
-                                status.textContent = data.data.enabled
-                                    ? 'Statique activé pour les utilisateurs connectés.'
-                                    : 'Rendu dynamique conservé pour les utilisateurs connectés.';
-                                if (data.data.warning) {
-                                    status.textContent += ' ' + data.data.warning;
-                                }
+                                status.textContent = data.data.warning ? data.data.warning : '';
                             })
                             .catch(function() {
                                 input.dataset.stored = previous ? '1' : '0';
@@ -1444,7 +1391,8 @@ function wp_static_admin_page_content()
                     <span class="wp-static-slider"></span>
                 </label>
                 <label for="wp-static-minify">
-                    Minification — compresser le HTML des pages statiques générées (suppression des espaces et commentaires inutiles).
+                    Minification — compresser le HTML des pages statiques générées.
+                    <span class="description">(suppression des espaces et commentaires inutiles)</span>
                 </label>
                 <span class="wp-static-status" id="wp-static-minify-status" aria-live="polite"></span>
             </div>
@@ -1481,7 +1429,7 @@ function wp_static_admin_page_content()
                             })
                             .then(function(data) {
                                 if (data && data.success) {
-                                    status.textContent = data.data.enabled ? 'Minification activée.' : 'Minification désactivée.';
+                                    status.textContent = '';
                                 } else {
                                     throw new Error('save_failed');
                                 }
@@ -1504,12 +1452,10 @@ function wp_static_admin_page_content()
                 </label>
                 <label for="wp-static-purge-orphans">
                     Purger les fichiers orphelins après une génération complète.
+                    <span class="description">(Supprime les fichiers statiques qui ne correspondent plus à une URL collectée — page supprimée, slug changé, type masqué, motif exclu…)</span>
                 </label>
                 <span class="wp-static-status" id="wp-static-purge-orphans-status" aria-live="polite"></span>
             </div>
-            <p class="description" style="margin: -8px 0 16px 0;">
-                Supprime les fichiers statiques qui ne correspondent plus à une URL collectée (page supprimée, slug changé, type masqué, motif exclu…).
-            </p>
             <script>
                 (function() {
                     var input = document.getElementById('wp-static-purge-orphans');
@@ -1543,7 +1489,7 @@ function wp_static_admin_page_content()
                             })
                             .then(function(data) {
                                 if (data && data.success) {
-                                    status.textContent = data.data.enabled ? 'Purge des orphelins activée.' : 'Purge des orphelins désactivée.';
+                                    status.textContent = '';
                                 } else {
                                     throw new Error('save_failed');
                                 }
@@ -1572,17 +1518,35 @@ function wp_static_admin_page_content()
                                 <option value="daily" <?php selected(wp_static_cron_frequency(), 'daily'); ?>>Quotidienne</option>
                                 <option value="weekly" <?php selected(wp_static_cron_frequency(), 'weekly'); ?>>Hebdomadaire</option>
                             </select>
-                            <p class="description">Filet de sécurité actif en modes Automatique et Complet. La fréquence reste mémorisée, mais la tâche est suspendue en mode Manuel.</p>
+                            <p class="description">Filet de sécurité actif en modes Automatique et Full. La fréquence reste mémorisée, mais la tâche est suspendue en mode Manuel.</p>
                         </td>
                     </tr>
                     <tr>
                         <th scope="row"><label for="wp-static-exclude-patterns">Exclusions par motif</label></th>
                         <td>
-                            <textarea id="wp-static-exclude-patterns" class="large-text code" rows="5" placeholder="/feed/*&#10;*/preview/*&#10;https://example.com/private/*"><?php echo esc_textarea(get_option(WP_STATIC_EXCLUDE_PATTERNS_OPTION, '')); ?></textarea>
+                            <textarea id="wp-static-exclude-patterns" class="large-text code" rows="5" placeholder="/feed/*&#10;*/preview/*&#10;https://example.com/private/*&#10;https://exemple.com/search/"><?php echo esc_textarea(get_option(WP_STATIC_EXCLUDE_PATTERNS_OPTION, '')); ?></textarea>
                             <p class="description">Un motif par ligne. Supporte <code>*</code>. Testé sur l'URL complète et sur le chemin (<code>/contact/</code>).</p>
                         </td>
                     </tr>
                 </table>
+                <div id="wp-static-always-regen-fields" <?php echo $wp_static_mode === 'auto' ? '' : ' style="display: none;"'; ?>>
+                    <table class="form-table" role="presentation">
+                        <tr>
+                            <th scope="row"><label for="wp-static-always-regen">URLs à toujours régénérer</label></th>
+                            <td>
+                                <textarea id="wp-static-always-regen" rows="4" class="large-text code" placeholder="<?php echo esc_attr(home_url('/')); ?>&#10;/actualites/*"><?php echo esc_textarea((string) get_option(WP_STATIC_ALWAYS_REGEN_OPTION, '')); ?></textarea>
+                                <p class="description">Une entrée par ligne, régénérée à chaque enregistrement de contenu (en plus des pages détectées). Utile pour les pages que les dépendances ne devinent pas (accueil « magazine », plan du site, listing personnalisé…). Une ligne peut être une URL complète ou un motif avec joker <code>*</code> (ex. <code>/actualites/*</code>). Visible en mode Automatique.</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><label for="wp-static-regen-classes">Classes déclenchant une régénération</label></th>
+                            <td>
+                                <textarea id="wp-static-regen-classes" rows="3" class="large-text code" placeholder=".remontees-auto&#10;.bloc-actualites"><?php echo esc_textarea((string) get_option(WP_STATIC_REGEN_CLASSES_OPTION, '')); ?></textarea>
+                                <p class="description">Une classe CSS par ligne (ex. <code>.remontees-auto</code>). Toute page dont le HTML contient une de ces classes est détectée automatiquement à la génération et régénérée à chaque enregistrement de contenu — pas de mapping manuel. Visible en mode Automatique.</p>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
                 <p>
                     <button type="button" class="button button-primary" id="wp-static-advanced-save">Enregistrer les paramètres avancés</button>
                     <span class="wp-static-status" id="wp-static-advanced-status" aria-live="polite"></span>
@@ -1597,6 +1561,8 @@ function wp_static_admin_page_content()
                     var status = document.getElementById('wp-static-advanced-status');
                     var cron = document.getElementById('wp-static-cron-frequency');
                     var patterns = document.getElementById('wp-static-exclude-patterns');
+                    var alwaysRegen = document.getElementById('wp-static-always-regen');
+                    var regenClasses = document.getElementById('wp-static-regen-classes');
                     var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
                     var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_static_toggle_action')); ?>;
 
@@ -1609,6 +1575,8 @@ function wp_static_admin_page_content()
                         body.append('nonce', nonce);
                         body.append('cron_frequency', cron.value);
                         body.append('exclude_patterns', patterns.value);
+                        body.append('always_regen', alwaysRegen ? alwaysRegen.value : '');
+                        body.append('regen_classes', regenClasses ? regenClasses.value : '');
 
                         fetch(ajaxUrl, {
                                 method: 'POST',
@@ -1623,6 +1591,12 @@ function wp_static_admin_page_content()
                             })
                             .then(function(data) {
                                 if (data && data.success) {
+                                    if (alwaysRegen && typeof data.data.always_regen !== 'undefined') {
+                                        alwaysRegen.value = data.data.always_regen;
+                                    }
+                                    if (regenClasses && typeof data.data.regen_classes !== 'undefined') {
+                                        regenClasses.value = data.data.regen_classes;
+                                    }
                                     status.textContent = 'Paramètres enregistrés.';
                                 } else {
                                     throw new Error('save_failed');
@@ -1740,26 +1714,22 @@ function wp_static_admin_page_content()
                 <input type="hidden" name="action" value="wp_static_generate">
                 <?php wp_nonce_field('wp_static_generate_action', 'wp_static_nonce'); ?>
                 <p>Cliquez sur le bouton ci-dessous pour générer toutes les pages statiques de votre site.</p>
-                <button type="submit" name="wp_static_generate" class="button button-primary" id="wp-static-generate-btn"<?php disabled($preprod_credentials_missing); ?>>
+                <p id="wp-static-batch-progress" class="wp-static-batch-progress" style="display:none;" aria-live="polite"></p>
+                <button type="button" name="wp_static_generate" class="button button-primary" id="wp-static-generate-btn"<?php disabled($preprod_credentials_missing); ?>>
                     <span class="wp-static-generate-label">Générer les pages statiques</span>
                     <span class="spinner wp-static-generate-spinner" style="display:none;float:none;margin:0 0 0 6px;vertical-align:middle;"></span>
                 </button>
             </form>
-            <script>
-                (function() {
-                    var form = document.getElementById('wp-static-generate-form');
-                    if (!form) {
-                        return;
-                    }
-                    var btn = document.getElementById('wp-static-generate-btn');
-                    var spinner = btn.querySelector('.wp-static-generate-spinner');
-                    form.addEventListener('submit', function() {
-                        btn.disabled = true;
-                        spinner.style.display = 'inline-block';
-                        spinner.classList.add('is-active');
-                    });
-                })();
-            </script>
+            <?php if (is_array($active_batch) && !empty($active_batch['remaining'])) : ?>
+                <p class="description wp-static-batch-resume-hint">
+                    Génération en cours :
+                    <?php
+                    $processed = $active_batch['total'] - count($active_batch['remaining']);
+                    echo esc_html($processed . ' / ' . $active_batch['total']);
+                    ?>
+                    — reprise automatique…
+                </p>
+            <?php endif; ?>
             <?php if (is_array($last_generation)) : ?>
                 <?php
                 $completed_at = (int) $last_generation['completed_at'];
@@ -1870,8 +1840,8 @@ function wp_static_admin_page_content()
             <?php
             $rows = wp_static_get_page_rows();
             $show_language = wp_static_is_wpml_active();
-            // La colonne « Dépend de » n'a de sens qu'en mode auto ciblé (régénération
-            // déclenchée par les dépendances). En mode manuel ou complet, on la masque.
+            // La colonne « Dépend de » n'a de sens qu'en mode automatique (régénération
+            // déclenchée par les dépendances). En mode manuel ou full, on la masque.
             $show_deps = (wp_static_get_mode() === 'auto');
 
             // Regroupement par type : un tableau distinct par type de page.
@@ -1896,7 +1866,7 @@ function wp_static_admin_page_content()
                                 <th scope="col">Dernière génération</th>
                                 <?php if ($show_deps) : ?>
                                     <th scope="col">Dépend de
-                                        <span class="wp-static-help dashicons dashicons-editor-help" tabindex="0" role="img" aria-label="Aide" data-tip="Contenus (articles, pages, CPT) affichés sur cette page via une remontée. Si l’un d’eux est modifié, cette page est régénérée automatiquement (mode auto)."></span>
+                                        <span class="wp-static-help dashicons dashicons-editor-help" tabindex="0" role="img" aria-label="Aide" data-tip="Contenus (articles, pages, CPT) affichés sur cette page via une remontée. Si l’un d’eux est modifié, cette page est régénérée automatiquement (mode automatique)."></span>
                                     </th>
                                 <?php endif; ?>
                                 <th scope="col">Action</th>
@@ -1943,36 +1913,28 @@ function wp_static_admin_page_content()
                             btn.disabled = true;
                             btn.textContent = 'Régénération…';
 
-                            var body = new URLSearchParams();
-                            body.append('action', 'wp_static_regenerate_url');
-                            body.append('nonce', nonce);
-                            body.append('url', url);
+                            if (typeof window.wpStaticRunBatch !== 'function') {
+                                btn.disabled = false;
+                                btn.textContent = label;
+                                window.alert('Génération par lots indisponible.');
+                                return;
+                            }
 
-                            fetch(ajaxUrl, {
-                                    method: 'POST',
-                                    credentials: 'same-origin',
-                                    headers: {
-                                        'Content-Type': 'application/x-www-form-urlencoded'
-                                    },
-                                    body: body.toString()
-                                })
-                                .then(function(r) {
-                                    return r.json();
-                                })
-                                .then(function(data) {
-                                    if (data && data.success) {
-                                        if (dateCell) {
-                                            dateCell.textContent = data.data.date || '—';
-                                        }
-                                    } else {
-                                        throw new Error('regen_failed');
+                            window.wpStaticRunBatch({
+                                urls: [url],
+                                onComplete: function(payload) {
+                                    if (dateCell && payload.result && !payload.result.failed) {
+                                        dateCell.textContent = 'À l’instant';
+                                    } else if (payload.result && payload.result.failed) {
+                                        window.alert('La régénération a échoué.');
                                     }
-                                })
-                                .catch(function() {})
-                                .finally(function() {
                                     btn.disabled = false;
                                     btn.textContent = label;
-                                });
+                                }
+                            }).catch(function() {
+                                btn.disabled = false;
+                                btn.textContent = label;
+                            });
                         });
                     });
 
@@ -2114,7 +2076,23 @@ function wp_static_admin_page_content()
                 var tabs = document.querySelectorAll('.wp-static-tabs .nav-tab');
                 var panels = document.querySelectorAll('.wp-static-tab-panel');
 
+                function listNeedsRefresh() {
+                    var rendered = window.wpStaticListMode || 'auto';
+                    var current = window.wpStaticCurrentMode || rendered;
+                    // La colonne « Dépend de » n'existe qu'en mode Automatique.
+                    return (rendered === 'auto') !== (current === 'auto');
+                }
+
                 function activate(target) {
+                    if (target === 'statique' && listNeedsRefresh()) {
+                        if (window.history && window.history.replaceState) {
+                            window.history.replaceState(null, '', '#statique');
+                        } else {
+                            window.location.hash = 'statique';
+                        }
+                        window.location.reload();
+                        return false;
+                    }
                     var found = false;
                     tabs.forEach(function(t) {
                         var match = t.getAttribute('data-tab') === target;
@@ -2136,7 +2114,9 @@ function wp_static_admin_page_content()
                     tab.addEventListener('click', function(e) {
                         e.preventDefault();
                         var target = tab.getAttribute('data-tab');
-                        activate(target);
+                        if (!activate(target)) {
+                            return;
+                        }
                         // Mémorise l'onglet courant pour le retrouver au rechargement.
                         if (window.history && window.history.replaceState) {
                             window.history.replaceState(null, '', '#' + target);
@@ -2158,10 +2138,498 @@ function wp_static_admin_page_content()
                         activate(target);
                     }
                 });
+
+                window.wpStaticRunBatch = (function() {
+                    var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+                    var batchNonce = <?php echo wp_json_encode(wp_create_nonce('wp_static_batch_action')); ?>;
+                    var running = false;
+
+                    function setProgress(text, show) {
+                        var el = document.getElementById('wp-static-batch-progress');
+                        if (!el) {
+                            return;
+                        }
+                        if (show) {
+                            el.style.display = '';
+                            el.textContent = text;
+                        } else if (!running) {
+                            el.style.display = 'none';
+                            el.textContent = '';
+                        }
+                    }
+
+                    function setGenerateBusy(busy) {
+                        var btn = document.getElementById('wp-static-generate-btn');
+                        if (!btn) {
+                            return;
+                        }
+                        var spinner = btn.querySelector('.wp-static-generate-spinner');
+                        btn.disabled = busy;
+                        if (spinner) {
+                            spinner.style.display = busy ? 'inline-block' : 'none';
+                            spinner.classList.toggle('is-active', busy);
+                        }
+                    }
+
+                    function post(action, params) {
+                        var body = new URLSearchParams();
+                        body.append('action', action);
+                        body.append('nonce', batchNonce);
+                        Object.keys(params || {}).forEach(function(key) {
+                            var value = params[key];
+                            if (Array.isArray(value)) {
+                                value.forEach(function(item) {
+                                    body.append(key + '[]', item);
+                                });
+                            } else if (value !== undefined && value !== null) {
+                                body.append(key, value);
+                            }
+                        });
+                        return fetch(ajaxUrl, {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded'
+                            },
+                            body: body.toString()
+                        }).then(function(r) {
+                            return r.json();
+                        });
+                    }
+
+                    function handleStep(data, options) {
+                        if (!data || !data.success) {
+                            var message = data && data.data && data.data.message
+                                ? data.data.message
+                                : 'La génération a échoué.';
+                            window.alert(message);
+                            throw new Error('batch_failed');
+                        }
+
+                        var payload = data.data || {};
+                        if (payload.processed !== undefined && payload.total !== undefined) {
+                            setProgress('Génération en cours : ' + payload.processed + ' / ' + payload.total, true);
+                        }
+
+                        if (payload.done) {
+                            setProgress('', false);
+                            if (options && typeof options.onComplete === 'function') {
+                                options.onComplete(payload);
+                            } else if (payload.result && payload.result.failed) {
+                                window.alert('Génération terminée avec ' + payload.result.failed + ' erreur(s).');
+                                window.location.reload();
+                            } else {
+                                window.location.reload();
+                            }
+                            return payload;
+                        }
+
+                        if (payload.lock_busy) {
+                            return new Promise(function(resolve) {
+                                setTimeout(resolve, 1500);
+                            }).then(function() {
+                                return step(options);
+                            });
+                        }
+
+                        return step(options);
+                    }
+
+                    function step(options) {
+                        return post('wp_static_batch_step').then(function(data) {
+                            return handleStep(data, options);
+                        });
+                    }
+
+                    function start(options) {
+                        options = options || {};
+                        if (running) {
+                            return Promise.resolve();
+                        }
+                        running = true;
+                        setGenerateBusy(true);
+
+                        var promise;
+                        if (options.resume) {
+                            promise = step(options);
+                        } else {
+                            var params = {};
+                            if (options.full) {
+                                params.full = '1';
+                            }
+                            if (options.urls && options.urls.length) {
+                                params.urls = options.urls;
+                            }
+                            promise = post('wp_static_batch_start', params).then(function(data) {
+                                if (!data || !data.success) {
+                                    var message = data && data.data && data.data.message
+                                        ? data.data.message
+                                        : 'Impossible de démarrer la génération.';
+                                    window.alert(message);
+                                    throw new Error('batch_start_failed');
+                                }
+                                var payload = data.data || {};
+                                if (payload.processed !== undefined && payload.total !== undefined) {
+                                    setProgress('Génération en cours : ' + payload.processed + ' / ' + payload.total, true);
+                                }
+                                if (payload.done) {
+                                    return handleStep(data, options);
+                                }
+                                return step(options);
+                            });
+                        }
+
+                        return promise.catch(function() {
+                            setProgress('', false);
+                        }).finally(function() {
+                            running = false;
+                            setGenerateBusy(false);
+                        });
+                    }
+
+                    return start;
+                })();
+
+                var generateBtn = document.getElementById('wp-static-generate-btn');
+                if (generateBtn) {
+                    generateBtn.addEventListener('click', function() {
+                        window.wpStaticRunBatch({ full: true });
+                    });
+                }
+                <?php if (!empty($_GET['wp_static_batch']) || (is_array($active_batch) && !empty($active_batch['remaining']))) : ?>
+                window.wpStaticRunBatch({ resume: true });
+                <?php endif; ?>
             })();
         </script>
     </div>
 <?php
+}
+
+/**
+ * Génération par lots (1 URL par requête AJAX) — évite les 504 gateway en preprod/prod.
+ */
+function wp_static_set_batch_processing($active)
+{
+    $GLOBALS['wp_static_batch_processing'] = (bool) $active;
+}
+
+function wp_static_is_batch_processing()
+{
+    return !empty($GLOBALS['wp_static_batch_processing']);
+}
+
+function wp_static_get_batch_job()
+{
+    $job = get_option(WP_STATIC_BATCH_JOB_OPTION, null);
+    if (!is_array($job)) {
+        return null;
+    }
+
+    $job = wp_parse_args($job, [
+        'full' => false,
+        'rebuild_deps_next' => false,
+        'purge_orphans' => false,
+        'remaining' => [],
+        'all_urls' => [],
+        'total' => 0,
+        'result' => [
+            'generated' => 0,
+            'skipped' => 0,
+            'failed' => 0,
+            'messages' => [],
+            'errors' => [],
+        ],
+        'started_at' => microtime(true),
+        'user_id' => 0,
+    ]);
+
+    $job['remaining'] = array_values(array_filter((array) $job['remaining']));
+    $job['all_urls'] = array_values(array_filter((array) $job['all_urls']));
+    $job['total'] = max(0, (int) $job['total']);
+
+    return $job;
+}
+
+function wp_static_save_batch_job(array $job)
+{
+    update_option(WP_STATIC_BATCH_JOB_OPTION, $job, false);
+}
+
+function wp_static_delete_batch_job()
+{
+    delete_option(WP_STATIC_BATCH_JOB_OPTION);
+}
+
+/**
+ * @return array<string,mixed>|false
+ */
+function wp_static_batch_create_job(array $urls, $full = false)
+{
+    if ($full) {
+        $urls = wp_static_collect_urls();
+    } else {
+        $urls = array_values(array_unique(array_filter($urls)));
+    }
+
+    if (empty($urls)) {
+        return false;
+    }
+
+    if (!file_exists(WP_STATIC_DIR) && !wp_mkdir_p(WP_STATIC_DIR)) {
+        return false;
+    }
+
+    $job = [
+        'full' => (bool) $full,
+        'rebuild_deps_next' => (bool) $full,
+        'purge_orphans' => (bool) $full && wp_static_should_purge_orphans(),
+        'remaining' => $urls,
+        'all_urls' => $urls,
+        'total' => count($urls),
+        'result' => [
+            'generated' => 0,
+            'skipped' => 0,
+            'failed' => 0,
+            'messages' => [],
+            'errors' => [],
+        ],
+        'started_at' => microtime(true),
+        'user_id' => get_current_user_id(),
+    ];
+
+    wp_static_save_batch_job($job);
+
+    return $job;
+}
+
+function wp_static_batch_merge_result(array &$into, array $from)
+{
+    $into['generated'] += max(0, (int) ($from['generated'] ?? 0));
+    $into['skipped'] += max(0, (int) ($from['skipped'] ?? 0));
+    $into['failed'] += max(0, (int) ($from['failed'] ?? 0));
+
+    foreach ($from['messages'] ?? [] as $message) {
+        $is_error = !empty($from['errors']) && in_array($message, (array) $from['errors'], true);
+        wp_static_add_result_message($into, $message, $is_error);
+    }
+}
+
+/**
+ * @return array<string,mixed>
+ */
+function wp_static_batch_finalize_job(array $job)
+{
+    if (!empty($job['purge_orphans']) && empty($job['result']['failed'])) {
+        $urls = !empty($job['all_urls']) ? $job['all_urls'] : wp_static_collect_urls();
+        $purged = wp_static_purge_orphan_static_files($urls);
+        if ($purged > 0) {
+            wp_static_add_result_message(
+                $job['result'],
+                $purged . ' fichier(s) statique(s) orphelin(s) supprimé(s).'
+            );
+        }
+    }
+
+    if (!empty($job['full']) && empty($job['result']['failed'])) {
+        delete_option(WP_STATIC_DIRTY_OPTION);
+    } elseif (!empty($job['result']['failed'])) {
+        wp_static_mark_dirty();
+    }
+
+    $stored = wp_static_store_last_generation_result($job['result'], $job['started_at']);
+    if (!empty($job['user_id'])) {
+        set_transient(WP_STATIC_RESULT_TRANSIENT_PREFIX . (int) $job['user_id'], $stored, MINUTE_IN_SECONDS);
+    }
+
+    wp_static_delete_batch_job();
+
+    return [
+        'done' => true,
+        'total' => $job['total'],
+        'processed' => $job['total'],
+        'remaining' => 0,
+        'result' => $stored,
+    ];
+}
+
+/**
+ * Traite un lot (1 URL par défaut). Utilisé par AJAX et WP-Cron.
+ *
+ * @return array<string,mixed>
+ */
+function wp_static_batch_process_step()
+{
+    $job = wp_static_get_batch_job();
+    if (!$job) {
+        return [
+            'done' => true,
+            'total' => 0,
+            'processed' => 0,
+            'remaining' => 0,
+        ];
+    }
+
+    if (empty($job['remaining'])) {
+        return wp_static_batch_finalize_job($job);
+    }
+
+    if (wp_static_preprod_credentials_missing()) {
+        wp_static_mark_dirty();
+        wp_static_delete_batch_job();
+
+        return [
+            'done' => true,
+            'total' => $job['total'],
+            'processed' => $job['total'] - count($job['remaining']),
+            'remaining' => 0,
+            'result' => [
+                'generated' => 0,
+                'skipped' => 0,
+                'failed' => 1,
+                'messages' => ['Génération impossible : identifiants Basic Auth manquants en préproduction.'],
+                'errors' => ['Génération impossible : identifiants Basic Auth manquants en préproduction.'],
+            ],
+        ];
+    }
+
+    $batch_size = (int) apply_filters('wp_static_batch_size', WP_STATIC_BATCH_SIZE);
+    $batch_size = max(1, $batch_size);
+    $urls = array_splice($job['remaining'], 0, $batch_size);
+    $rebuild_deps = !empty($job['rebuild_deps_next']);
+    if ($rebuild_deps) {
+        $job['rebuild_deps_next'] = false;
+    }
+
+    $step_result = [
+        'generated' => 0,
+        'skipped' => 0,
+        'failed' => 0,
+        'messages' => [],
+        'errors' => [],
+    ];
+
+    wp_static_set_batch_processing(true);
+    try {
+        $ran = wp_static_with_gen_lock(function () use ($urls, $rebuild_deps, &$step_result) {
+            wp_static_generate_urls($urls, $step_result, $rebuild_deps);
+
+            return true;
+        });
+    } finally {
+        wp_static_set_batch_processing(false);
+    }
+
+    if ($ran === false) {
+        $job['remaining'] = array_merge($urls, $job['remaining']);
+        if ($rebuild_deps) {
+            $job['rebuild_deps_next'] = true;
+        }
+        wp_static_save_batch_job($job);
+
+        return [
+            'done' => false,
+            'lock_busy' => true,
+            'total' => $job['total'],
+            'processed' => $job['total'] - count($job['remaining']),
+            'remaining' => count($job['remaining']),
+        ];
+    }
+
+    wp_static_batch_merge_result($job['result'], $step_result);
+    wp_static_save_batch_job($job);
+
+    $processed = $job['total'] - count($job['remaining']);
+
+    if (empty($job['remaining'])) {
+        return wp_static_batch_finalize_job($job);
+    }
+
+    return [
+        'done' => false,
+        'total' => $job['total'],
+        'processed' => $processed,
+        'remaining' => count($job['remaining']),
+        'last_url' => end($urls) ?: '',
+    ];
+}
+
+function wp_static_ajax_batch_start()
+{
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_static_batch_action', 'nonce');
+
+    if (wp_static_preprod_credentials_missing()) {
+        wp_send_json_error([
+            'message' => 'Identifiants Basic Auth manquants en préproduction.',
+        ], 400);
+    }
+
+    $existing = wp_static_get_batch_job();
+    if ($existing && !empty($existing['remaining'])) {
+        wp_send_json_success([
+            'resumed' => true,
+            'total' => $existing['total'],
+            'processed' => $existing['total'] - count($existing['remaining']),
+            'remaining' => count($existing['remaining']),
+            'done' => false,
+        ]);
+    }
+
+    $full = !empty($_POST['full']);
+    $urls = [];
+    if (!empty($_POST['urls']) && is_array($_POST['urls'])) {
+        foreach ($_POST['urls'] as $raw_url) {
+            $url = esc_url_raw(wp_unslash($raw_url));
+            if ($url && wp_static_is_local_url($url)) {
+                $urls[] = $url;
+            }
+        }
+    }
+
+    if (!$full && empty($urls)) {
+        wp_send_json_error(['message' => 'Aucune URL à générer.'], 400);
+    }
+
+    $job = wp_static_batch_create_job($urls, $full);
+    if ($job === false) {
+        wp_send_json_error(['message' => 'Impossible de créer la file de génération.'], 500);
+    }
+
+    wp_send_json_success([
+        'started' => true,
+        'total' => $job['total'],
+        'processed' => 0,
+        'remaining' => $job['total'],
+        'done' => false,
+    ]);
+}
+
+function wp_static_ajax_batch_step()
+{
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_static_batch_action', 'nonce');
+
+    wp_send_json_success(wp_static_batch_process_step());
+}
+
+function wp_static_ajax_batch_cancel()
+{
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_static_batch_action', 'nonce');
+
+    wp_static_delete_batch_job();
+    wp_static_release_gen_lock();
+
+    wp_send_json_success(['cancelled' => true]);
 }
 
 function wp_static_handle_generate_request()
@@ -2172,10 +2640,40 @@ function wp_static_handle_generate_request()
 
     check_admin_referer('wp_static_generate_action', 'wp_static_nonce');
 
-    $result = wp_static_run_generation();
-    set_transient(WP_STATIC_RESULT_TRANSIENT_PREFIX . get_current_user_id(), $result, MINUTE_IN_SECONDS);
+    if (wp_static_preprod_credentials_missing()) {
+        set_transient(
+            WP_STATIC_RESULT_TRANSIENT_PREFIX . get_current_user_id(),
+            [
+                'generated' => 0,
+                'skipped' => 0,
+                'failed' => 1,
+                'messages' => ['Génération impossible : identifiants Basic Auth manquants en préproduction.'],
+                'errors' => ['Génération impossible : identifiants Basic Auth manquants en préproduction.'],
+            ],
+            MINUTE_IN_SECONDS
+        );
+        wp_safe_redirect(admin_url('admin.php?page=wp-static-generator'));
+        exit;
+    }
 
-    wp_safe_redirect(admin_url('admin.php?page=wp-static-generator'));
+    $job = wp_static_batch_create_job([], true);
+    if ($job === false) {
+        set_transient(
+            WP_STATIC_RESULT_TRANSIENT_PREFIX . get_current_user_id(),
+            [
+                'generated' => 0,
+                'skipped' => 0,
+                'failed' => 1,
+                'messages' => ['Impossible de démarrer la génération (aucune URL ou dossier statique inaccessible).'],
+                'errors' => ['Impossible de démarrer la génération.'],
+            ],
+            MINUTE_IN_SECONDS
+        );
+        wp_safe_redirect(admin_url('admin.php?page=wp-static-generator'));
+        exit;
+    }
+
+    wp_safe_redirect(admin_url('admin.php?page=wp-static-generator&wp_static_batch=1'));
     exit;
 }
 
@@ -2474,7 +2972,7 @@ function wp_static_ajax_toggle_minify()
 
 /**
  * Autorise / refuse le cache statique pour le cookie de connexion WordPress.
- * Le mode Complet force ce comportement sans écraser la préférence mémorisée.
+ * Le mode Full force ce comportement sans écraser la préférence mémorisée.
  */
 function wp_static_ajax_toggle_serve_logged_in()
 {
@@ -2609,6 +3107,22 @@ function wp_static_ajax_save_advanced()
     update_option(WP_STATIC_EXCLUDE_PATTERNS_OPTION, $patterns);
     wp_static_reschedule_cron(wp_static_effective_cron_frequency());
 
+    $always_regen = isset($_POST['always_regen']) ? wp_unslash($_POST['always_regen']) : '';
+    $always_regen = wp_static_sanitize_urls_text($always_regen);
+    update_option(WP_STATIC_ALWAYS_REGEN_OPTION, $always_regen, false);
+
+    $classes_raw = isset($_POST['regen_classes']) ? wp_unslash($_POST['regen_classes']) : '';
+    $classes_clean = wp_static_sanitize_classes_text($classes_raw);
+    $previous_classes = (string) get_option(WP_STATIC_REGEN_CLASSES_OPTION, '');
+    update_option(WP_STATIC_REGEN_CLASSES_OPTION, $classes_clean, false);
+
+    // L'index courant a été construit avec l'ancienne liste. On ne mélange pas
+    // les deux contrats : la prochaine génération complète le reconstruira.
+    if ($classes_clean !== $previous_classes) {
+        delete_option(WP_STATIC_DYNAMIC_URLS_OPTION);
+        wp_static_mark_dirty();
+    }
+
     $current_patterns = wp_static_get_exclusion_patterns();
     if ($current_patterns !== $previous_patterns) {
         $excluded_urls = [];
@@ -2634,41 +3148,8 @@ function wp_static_ajax_save_advanced()
 
     wp_send_json_success([
         'cron_frequency' => $frequency,
-    ]);
-}
-
-/**
- * Enregistre la liste des URLs à toujours régénérer (option Auto).
- */
-function wp_static_ajax_save_always_regen()
-{
-    if (!current_user_can('manage_options')) {
-        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
-    }
-
-    check_ajax_referer('wp_static_toggle_action', 'nonce');
-
-    $raw = isset($_POST['always_regen']) ? wp_unslash($_POST['always_regen']) : '';
-    $clean = wp_static_sanitize_urls_text($raw);
-    update_option(WP_STATIC_ALWAYS_REGEN_OPTION, $clean, false);
-
-    $classes_raw = isset($_POST['regen_classes']) ? wp_unslash($_POST['regen_classes']) : '';
-    $classes_clean = wp_static_sanitize_classes_text($classes_raw);
-    $previous_classes = (string) get_option(WP_STATIC_REGEN_CLASSES_OPTION, '');
-    update_option(WP_STATIC_REGEN_CLASSES_OPTION, $classes_clean, false);
-
-    // L'index courant a été construit avec l'ancienne liste. On ne mélange pas
-    // les deux contrats : la prochaine génération complète le reconstruira.
-    if ($classes_clean !== $previous_classes) {
-        delete_option(WP_STATIC_DYNAMIC_URLS_OPTION);
-        wp_static_mark_dirty();
-    }
-
-    wp_send_json_success([
-        'value'         => $clean,
-        'count'         => count(wp_static_get_always_regen_urls()),
-        'classes'       => $classes_clean,
-        'classes_count' => count(wp_static_get_regen_classes()),
+        'always_regen'   => $always_regen,
+        'regen_classes'  => $classes_clean,
     ]);
 }
 
@@ -2743,6 +3224,7 @@ function wp_static_ajax_clear_cache()
 
 /**
  * Régénération d'une seule page depuis le tableau d'administration (AJAX).
+ * Conservé pour compatibilité ; préférer la génération par lots côté JS.
  */
 function wp_static_ajax_regenerate_url()
 {
@@ -2757,42 +3239,23 @@ function wp_static_ajax_regenerate_url()
         wp_send_json_error(['message' => 'URL invalide.'], 400);
     }
 
-    $result = ['generated' => 0, 'skipped' => 0, 'failed' => 0, 'messages' => []];
-    try {
-        $ran = wp_static_with_gen_lock(function () use ($url, &$result) {
-            wp_static_generate_urls([$url], $result);
-        });
-    } catch (Throwable $error) {
-        $ran = false;
-        wp_static_mark_dirty();
+    if (wp_static_get_batch_job()) {
+        wp_send_json_error([
+            'message' => 'Une génération par lots est déjà en cours.',
+        ], 409);
     }
 
-    if ($ran === false) {
-        if (!wp_static_add_pending_regen([$url])) {
-            wp_send_json_error([
-                'message' => 'La génération est occupée et la page n’a pas pu être mise en attente.',
-            ], 503);
-        }
-        wp_send_json_success([
-            'status'  => 'pending',
-            'label'   => wp_static_status_label('pending'),
-            'date'    => wp_static_format_generation_date($url),
-            'message' => 'Une génération est en cours ; cette page a été mise en file d’attente.',
-        ]);
-    }
-
-    $status = 'failed';
-    if ($result['generated']) {
-        $status = 'generated';
-    } elseif ($result['skipped']) {
-        $status = 'skipped';
+    $job = wp_static_batch_create_job([$url], false);
+    if ($job === false) {
+        wp_send_json_error(['message' => 'Impossible de démarrer la régénération.'], 500);
     }
 
     wp_send_json_success([
-        'status'  => $status,
-        'label'   => wp_static_status_label($status),
-        'date'    => wp_static_format_generation_date($url),
-        'message' => !empty($result['messages']) ? end($result['messages']) : '',
+        'batch' => true,
+        'total' => 1,
+        'processed' => 0,
+        'remaining' => 1,
+        'done' => false,
     ]);
 }
 
@@ -3799,6 +4262,19 @@ function wp_static_schedule_pending_regen()
 }
 
 /**
+ * Lance le traitement de la file d'attente sans attendre le cron (+1 min).
+ */
+function wp_static_kick_pending_regen()
+{
+    wp_clear_scheduled_hook(WP_STATIC_PENDING_CRON_HOOK);
+    wp_schedule_single_event(time(), WP_STATIC_PENDING_CRON_HOOK, [], true);
+
+    if (function_exists('spawn_cron')) {
+        spawn_cron();
+    }
+}
+
+/**
  * @param callable():mixed $callback
  * @return mixed|false
  */
@@ -3818,12 +4294,57 @@ function wp_static_with_gen_lock($callback)
         return call_user_func($callback);
     } finally {
         wp_static_release_gen_lock();
-        wp_static_maybe_process_pending_regen();
+        if (!wp_static_is_batch_processing()) {
+            wp_static_maybe_process_pending_regen();
+        }
     }
+}
+
+/**
+ * Retire une URL de la file d'attente pending (1 URL max).
+ *
+ * @return string|null
+ */
+function wp_static_take_one_pending_url()
+{
+    $url = null;
+
+    $taken = wp_static_with_pending_lock(function () use (&$url) {
+        $pending = wp_static_get_pending_regen();
+        if ($pending['full'] || empty($pending['urls'])) {
+            return $pending['full'] ? 'full' : null;
+        }
+
+        $url = array_key_first($pending['urls']);
+        if ($url === null) {
+            return null;
+        }
+
+        unset($pending['urls'][$url]);
+        wp_static_save_pending_regen($pending);
+
+        return $url;
+    });
+
+    if ($taken === 'full') {
+        wp_static_with_pending_lock(function () {
+            $pending = wp_static_get_pending_regen();
+            $pending['full'] = false;
+            wp_static_save_pending_regen($pending);
+        });
+
+        return '__full__';
+    }
+
+    return is_string($taken) && $taken !== '' ? $taken : null;
 }
 
 function wp_static_maybe_process_pending_regen()
 {
+    if (wp_static_is_batch_processing()) {
+        return;
+    }
+
     static $processing = false;
     if ($processing) {
         return;
@@ -3831,63 +4352,64 @@ function wp_static_maybe_process_pending_regen()
 
     $processing = true;
     try {
-        // Plusieurs lots peuvent arriver pendant le traitement. On les absorbe
-        // sans récursion, avec une borne ; le cron reprendrait un éventuel reste.
-        for ($iteration = 0; $iteration < 5; $iteration++) {
-            $batch = wp_static_take_pending_regen_batch();
-            if ($batch === null) {
-                break;
+        $job = wp_static_get_batch_job();
+        if ($job && !empty($job['remaining'])) {
+            wp_static_batch_process_step();
+            if (wp_static_get_batch_job()) {
+                wp_static_schedule_pending_regen();
             }
-            if ($batch === false) {
+
+            return;
+        }
+
+        $work = wp_static_take_one_pending_url();
+        if ($work === null) {
+            return;
+        }
+
+        if ($work === '__full__') {
+            if (!wp_static_batch_create_job([], true)) {
                 wp_static_mark_dirty();
-                break;
+
+                return;
+            }
+            wp_static_batch_process_step();
+            if (wp_static_get_batch_job()) {
+                wp_static_schedule_pending_regen();
             }
 
-            if (!wp_static_acquire_gen_lock()) {
-                wp_static_restore_pending_regen_batch($batch);
-                break;
-            }
+            return;
+        }
 
-            $completed = false;
-            try {
-                @set_time_limit(0);
+        if (!wp_static_acquire_gen_lock()) {
+            wp_static_add_pending_regen([$work]);
 
-                $result = ['generated' => 0, 'skipped' => 0, 'failed' => 0, 'messages' => []];
-                $urls = !empty($batch['full']) ? wp_static_collect_urls() : $batch['urls'];
-                wp_static_generate_urls($urls, $result, !empty($batch['full']));
+            return;
+        }
 
-                if (!empty($batch['full']) && wp_static_should_purge_orphans()) {
-                    wp_static_purge_orphan_static_files($urls);
-                }
+        try {
+            @set_time_limit(0);
 
-                if (!empty($batch['full']) && empty($result['failed'])) {
-                    delete_option(WP_STATIC_DIRTY_OPTION);
-                }
+            $result = ['generated' => 0, 'skipped' => 0, 'failed' => 0, 'messages' => []];
+            wp_static_generate_urls([$work], $result, false);
 
-                if (!empty($result['failed'])) {
-                    wp_static_mark_dirty();
-                }
-
-                $completed = true;
-            } catch (Throwable $error) {
-                wp_static_restore_pending_regen_batch($batch);
+            if (!empty($result['failed'])) {
                 wp_static_mark_dirty();
-                error_log('[WP Static] Génération en attente restaurée après une exception : ' . $error->getMessage());
-            } finally {
-                wp_static_release_gen_lock();
             }
+        } catch (Throwable $error) {
+            wp_static_add_pending_regen([$work]);
+            wp_static_mark_dirty();
+            error_log('[WP Static] Régénération en attente restaurée après une exception : ' . $error->getMessage());
+        } finally {
+            wp_static_release_gen_lock();
+        }
 
-            if (!$completed) {
-                break;
-            }
+        $remaining = wp_static_get_pending_regen();
+        if ($remaining['full'] || $remaining['urls']) {
+            wp_static_schedule_pending_regen();
         }
     } finally {
         $processing = false;
-    }
-
-    $remaining = wp_static_get_pending_regen();
-    if ($remaining['full'] || $remaining['urls']) {
-        wp_static_schedule_pending_regen();
     }
 }
 
@@ -3939,33 +4461,15 @@ function wp_static_process_regen_queue()
     $GLOBALS['wp_static_regen_queue'] = [];
     $GLOBALS['wp_static_regen_full'] = false;
 
-    try {
-        $ran = wp_static_with_gen_lock(function () use ($urls, $is_full) {
-            $urls = $is_full ? wp_static_collect_urls() : $urls;
-            $result = ['generated' => 0, 'skipped' => 0, 'failed' => 0, 'messages' => []];
-            wp_static_generate_urls($urls, $result, $is_full);
-
-            if (!empty($result['failed'])) {
-                wp_static_mark_dirty();
-            } elseif ($is_full) {
-                if (wp_static_should_purge_orphans()) {
-                    wp_static_purge_orphan_static_files($urls);
-                }
-                delete_option(WP_STATIC_DIRTY_OPTION);
-            }
-
-            return $result;
-        });
-    } catch (Throwable $error) {
-        wp_static_add_pending_regen($urls, $is_full);
-        wp_static_mark_dirty();
-        error_log('[WP Static] File de fin de requête restaurée après une exception : ' . $error->getMessage());
+    if ($is_full) {
+        wp_static_add_pending_regen([], true);
+    } elseif (!empty($urls)) {
+        wp_static_add_pending_regen($urls);
+    } else {
         return;
     }
 
-    if ($ran === false) {
-        wp_static_add_pending_regen($urls, $is_full);
-    }
+    wp_static_kick_pending_regen();
 }
 
 /**
@@ -3988,29 +4492,25 @@ function wp_static_on_permalinks_saved()
 }
 
 /**
- * Élément « WP Static » dans la barre d'administration (header), visible dès
- * que le plugin est actif. Indique l'état du service statique et, en rouge,
- * lorsqu'une régénération est nécessaire.
+ * Élément « WP Static » dans la barre d'administration (header), uniquement
+ * lorsque le service est activé. Indique l'état et, en rouge, lorsqu'une
+ * régénération est nécessaire.
  */
 function wp_static_admin_bar_menu($wp_admin_bar)
 {
-    if (!current_user_can('manage_options')) {
+    if (!current_user_can('manage_options') || !wp_static_is_enabled()) {
         return;
     }
 
-    $enabled = wp_static_is_enabled();
-    $dirty   = wp_static_is_dirty();
-    $url     = admin_url('admin.php?page=wp-static-generator');
+    $dirty = wp_static_is_dirty();
+    $url   = admin_url('admin.php?page=wp-static-generator');
 
     if ($dirty) {
         $color = '#d63638'; // rouge : à régénérer
         $state = 'à régénérer';
-    } elseif ($enabled) {
+    } else {
         $color = '#46b450'; // vert : service actif
         $state = 'actif';
-    } else {
-        $color = '#a7aaad'; // gris : service désactivé
-        $state = 'inactif';
     }
 
     $wp_admin_bar->add_node([
@@ -4022,7 +4522,7 @@ function wp_static_admin_bar_menu($wp_admin_bar)
     $wp_admin_bar->add_node([
         'parent' => 'wp-static',
         'id'     => 'wp-static-state',
-        'title'  => $enabled ? 'Service statique : activé' : 'Service statique : désactivé',
+        'title'  => 'Service statique : activé',
         'href'   => $url,
     ]);
 
@@ -4044,7 +4544,7 @@ function wp_static_admin_bar_menu($wp_admin_bar)
  */
 function wp_static_admin_bar_flash_script()
 {
-    if (!current_user_can('manage_options') || !is_admin_bar_showing()) {
+    if (!current_user_can('manage_options') || !wp_static_is_enabled() || !is_admin_bar_showing()) {
         return;
     }
 
@@ -4104,9 +4604,29 @@ function wp_static_admin_bar_flash_script()
 <?php
 }
 
+function wp_static_is_generator_screen()
+{
+    if (!is_admin()) {
+        return false;
+    }
+
+    if (function_exists('get_current_screen')) {
+        $screen = get_current_screen();
+        if ($screen && isset($screen->id) && $screen->id === 'toplevel_page_wp-static-generator') {
+            return true;
+        }
+    }
+
+    return isset($_GET['page']) && $_GET['page'] === 'wp-static-generator';
+}
+
 function wp_static_dirty_admin_notice()
 {
-    if (!current_user_can('manage_options') || !wp_static_is_dirty()) {
+    if (!current_user_can('manage_options') || !wp_static_is_enabled() || !wp_static_is_dirty()) {
+        return;
+    }
+    // Sur la page plugin, le bandeau est rendu au-dessus du titre.
+    if (wp_static_is_generator_screen()) {
         return;
     }
     $url = admin_url('admin.php?page=wp-static-generator');
@@ -4119,6 +4639,9 @@ function wp_static_dirty_admin_notice()
 function wp_static_preprod_credentials_admin_notice()
 {
     if (!current_user_can('manage_options') || !wp_static_preprod_credentials_missing()) {
+        return;
+    }
+    if (wp_static_is_generator_screen()) {
         return;
     }
 
@@ -4346,7 +4869,186 @@ function wp_static_collect_url_items_for_current_language($language = null)
         }
     }
 
+    $error_url = wp_static_error_page_url($language);
+    if ($error_url && !isset($items[$error_url])) {
+        $items[$error_url] = [
+            'title'      => '404 — Page introuvable',
+            'type'       => 'Erreur',
+            'template'   => '404.php',
+            'error_page' => '404',
+        ];
+    }
+
     return $items;
+}
+
+/**
+ * Chemin relatif (sans domaine) de la page 404 générée en statique.
+ */
+function wp_static_error_page_path()
+{
+    return trim(apply_filters('wp_static_error_page_path', WP_STATIC_ERROR_PAGE_PATH), '/');
+}
+
+/**
+ * URL publique utilisée pour capturer le template 404.php lors de la génération.
+ *
+ * @param array<string,mixed>|null $language Entrée WPML (clé « url ») ou null.
+ */
+function wp_static_error_page_url($language = null)
+{
+    $path = wp_static_error_page_path();
+    $base = home_url('/');
+
+    if (is_array($language) && !empty($language['url'])) {
+        $base = $language['url'];
+    }
+
+    return trailingslashit(trailingslashit($base) . $path);
+}
+
+/**
+ * @return string[]
+ */
+function wp_static_get_error_page_urls()
+{
+    static $urls = null;
+
+    if ($urls !== null) {
+        return $urls;
+    }
+
+    $urls = [];
+    $languages = wp_static_wpml_languages();
+    if (!empty($languages)) {
+        foreach ($languages as $language) {
+            $urls[] = wp_static_error_page_url($language);
+        }
+    } else {
+        $urls[] = wp_static_error_page_url();
+    }
+
+    $urls = array_values(array_unique(array_filter($urls)));
+
+    return apply_filters('wp_static_error_page_urls', $urls);
+}
+
+function wp_static_url_is_error_page($url)
+{
+    $normalized = untrailingslashit(strtok((string) $url, '?'));
+
+    foreach (wp_static_get_error_page_urls() as $error_url) {
+        if (untrailingslashit($error_url) === $normalized) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function wp_static_current_request_path()
+{
+    $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
+    $path = wp_parse_url($uri, PHP_URL_PATH);
+
+    return (is_string($path) && $path !== '') ? $path : '/';
+}
+
+function wp_static_is_error_page_request_path()
+{
+    $current = untrailingslashit(wp_static_current_request_path());
+
+    foreach (wp_static_get_error_page_urls() as $url) {
+        $path = wp_parse_url($url, PHP_URL_PATH);
+        if (is_string($path) && untrailingslashit($path) === $current) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function wp_static_error_page_url_for_current_request()
+{
+    $host = isset($_SERVER['HTTP_HOST']) ? strtolower((string) $_SERVER['HTTP_HOST']) : '';
+
+    foreach (wp_static_get_error_page_urls() as $url) {
+        $url_host = wp_parse_url($url, PHP_URL_HOST);
+        if ($url_host && strtolower((string) $url_host) === $host) {
+            return $url;
+        }
+    }
+
+    return wp_static_error_page_url();
+}
+
+/**
+ * @return bool True si le fichier a été servi (exit).
+ */
+function wp_static_output_error_page_static($http_code = 404)
+{
+    $static_file = wp_static_path_for_url(wp_static_error_page_url_for_current_request());
+    if ($static_file === '' || !file_exists($static_file)) {
+        return false;
+    }
+
+    $real_file = realpath($static_file);
+    $real_base = realpath(WP_STATIC_DIR);
+    if ($real_file === false || $real_base === false || strpos($real_file, $real_base . DIRECTORY_SEPARATOR) !== 0) {
+        return false;
+    }
+
+    status_header((int) $http_code);
+    header('Content-Type: text/html; charset=UTF-8');
+    header('X-Static-Cache: HIT-404');
+
+    $mtime = filemtime($real_file);
+    $etag = '"' . md5($mtime . '-' . filesize($real_file)) . '"';
+    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $mtime) . ' GMT');
+    header('ETag: ' . $etag);
+    header('Cache-Control: public, max-age=0, must-revalidate');
+
+    readfile($real_file);
+    exit;
+}
+
+function wp_static_error_page_generation_status_header($status_header, $code)
+{
+    if ((int) $code === 404 && wp_static_is_generation_request() && wp_static_is_error_page_request_path()) {
+        return '200 OK';
+    }
+
+    return $status_header;
+}
+
+function wp_static_serve_error_page_on_404()
+{
+    if (!wp_static_is_enabled() || wp_static_is_generation_request()) {
+        return;
+    }
+
+    $request_method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : '';
+    if (is_admin() || wp_doing_ajax() || is_search() || $request_method !== 'GET') {
+        return;
+    }
+
+    if (!empty($_SERVER['QUERY_STRING'])) {
+        return;
+    }
+
+    if (wp_static_request_has_private_cookie(null, wp_static_should_serve_logged_in())) {
+        return;
+    }
+
+    if (wp_static_is_error_page_request_path()) {
+        return;
+    }
+
+    if (!is_404()) {
+        return;
+    }
+
+    wp_static_output_error_page_static(404);
 }
 
 /**
@@ -4914,8 +5616,18 @@ function wp_static_generate_urls($urls, &$result, $rebuild_deps = false)
             continue;
         }
 
+        if (wp_static_response_is_static_cache($response)) {
+            $result['failed']++;
+            wp_static_add_result_message(
+                $result,
+                'Erreur lors de la génération de ' . $url . ' : le gateway statique a servi une page en cache au lieu du rendu WordPress. Réessayez ou vérifiez le jeton de génération.',
+                true
+            );
+            continue;
+        }
+
         $status_code = wp_remote_retrieve_response_code($response);
-        if ($status_code === 404) {
+        if ($status_code === 404 && !wp_static_url_is_error_page($url)) {
             $result['skipped']++;
             wp_static_add_result_message($result, 'Page ignorée (404) : ' . $url);
             unset($deps[$url]);
@@ -4925,6 +5637,10 @@ function wp_static_generate_urls($urls, &$result, $rebuild_deps = false)
             }
             wp_static_delete_static_file($url);
             continue;
+        }
+
+        if ($status_code === 404 && wp_static_url_is_error_page($url)) {
+            $status_code = 200;
         }
 
         // Une redirection (301/302/307/308) n'a pas de contenu statique propre :
@@ -5252,8 +5968,11 @@ function wp_static_fetch_url($url, $headers = [])
         $headers['Authorization'] = $auth;
     }
 
+    $is_generation_request = !empty($headers['X-WP-Static-Token']);
+    $timeout = $is_generation_request ? 120 : 30;
+
     $args = [
-        'timeout' => 30,
+        'timeout' => $timeout,
         // Ne jamais transférer l'en-tête Basic Auth à une cible de redirection.
         // La génération ignore de toute façon les réponses 3xx.
         'redirection' => 0,
@@ -5262,35 +5981,47 @@ function wp_static_fetch_url($url, $headers = [])
         $args['headers'] = $headers;
     }
 
-    $response = wp_remote_get($url, $args);
-    if (
-        !is_wp_error($response)
-        && wp_remote_retrieve_response_code($response) < 500
-    ) {
-        return [
-            'response' => $response,
-            'fallback_url' => null,
-        ];
-    }
-
-    // La requête loopback a échoué. C'est fréquent en local (Docker) : le
-    // domaine public n'est résolu que par le navigateur de la machine hôte,
-    // pas depuis le conteneur PHP. On réessaie alors via le service web
-    // interne, en conservant l'en-tête Host public pour servir la bonne page.
     $internal_hosts = wp_static_get_internal_hosts();
-    if (!$internal_hosts) {
+
+    // Docker/local : éviter le domaine public (cache gateway, résolution DNS)
+    // et cibler directement nginx en conservant l'en-tête Host public.
+    if ($is_generation_request && $internal_hosts) {
+        $internal_result = wp_static_fetch_url_via_internal_hosts($url, $args, $internal_hosts, $is_generation_request);
+        if ($internal_result !== null) {
+            return $internal_result;
+        }
+    }
+
+    $response = wp_remote_get($url, $args);
+    if (wp_static_fetch_url_is_acceptable($response, $is_generation_request)) {
         return [
             'response' => $response,
             'fallback_url' => null,
         ];
     }
 
+    // Fallback interne si la requête publique a échoué ou renvoyé du cache statique.
+    if (!$is_generation_request && $internal_hosts) {
+        $internal_result = wp_static_fetch_url_via_internal_hosts($url, $args, $internal_hosts, $is_generation_request);
+        if ($internal_result !== null) {
+            return $internal_result;
+        }
+    }
+
+    return [
+        'response' => $response,
+        'fallback_url' => null,
+    ];
+}
+
+/**
+ * @return array{response:mixed,fallback_url:?string}|null
+ */
+function wp_static_fetch_url_via_internal_hosts($url, $args, $internal_hosts, $is_generation_request)
+{
     $parts = wp_parse_url($url);
     if (empty($parts['host'])) {
-        return [
-            'response' => $response,
-            'fallback_url' => null,
-        ];
+        return null;
     }
 
     $public_host = $parts['host'];
@@ -5301,24 +6032,19 @@ function wp_static_fetch_url($url, $headers = [])
 
     $internal_args = $args;
     $internal_args['sslverify'] = false;
-    // On ne suit pas les redirections sur l'hôte interne : une éventuelle
-    // redirection pointe vers le domaine public (injoignable depuis le
-    // conteneur) et sera de toute façon ignorée par la génération.
     $internal_args['redirection'] = 0;
     $internal_args['headers'] = array_merge(
         isset($args['headers']) ? $args['headers'] : [],
         ['Host' => $public_host]
     );
 
+    $response = null;
     foreach ($internal_hosts as $internal_host) {
         foreach (['https', 'http'] as $scheme) {
             $internal_url = $scheme . '://' . $internal_host . $path;
             $internal_response = wp_remote_get($internal_url, $internal_args);
 
-            if (
-                !is_wp_error($internal_response)
-                && wp_remote_retrieve_response_code($internal_response) < 500
-            ) {
+            if (wp_static_fetch_url_is_acceptable($internal_response, $is_generation_request)) {
                 return [
                     'response' => $internal_response,
                     'fallback_url' => $internal_url,
@@ -5329,10 +6055,7 @@ function wp_static_fetch_url($url, $headers = [])
         }
     }
 
-    return [
-        'response' => $response,
-        'fallback_url' => null,
-    ];
+    return null;
 }
 
 /**
@@ -5357,8 +6080,8 @@ function wp_static_get_internal_hosts()
         }
 
         if (defined('ENV_LOCAL') && ENV_LOCAL) {
-            $hosts[] = 'apache';
             $hosts[] = 'nginx';
+            $hosts[] = 'apache';
         }
     }
 
@@ -5471,13 +6194,72 @@ function wp_static_generation_token_file()
         . '/wp-static-' . sha1(str_replace('\\', '/', $root)) . '.token';
 }
 
+/**
+ * Valide le jeton de génération (transient WordPress + fichier partagé pré-WP).
+ */
+function wp_static_is_valid_generation_token($request_token)
+{
+    if (!is_string($request_token) || $request_token === '') {
+        return false;
+    }
+
+    $token = get_transient(WP_STATIC_GEN_TOKEN_TRANSIENT);
+    if (is_string($token) && $token !== '' && hash_equals($token, $request_token)) {
+        return true;
+    }
+
+    $file = wp_static_generation_token_file();
+    if (!is_file($file)) {
+        return false;
+    }
+
+    $stored = trim((string) @file_get_contents($file));
+
+    return $stored !== '' && hash_equals($stored, $request_token);
+}
+
 function wp_static_is_generation_request()
 {
     if (empty($_SERVER['HTTP_X_WP_STATIC_TOKEN'])) {
         return false;
     }
-    $token = get_transient(WP_STATIC_GEN_TOKEN_TRANSIENT);
-    return $token && hash_equals($token, (string) $_SERVER['HTTP_X_WP_STATIC_TOKEN']);
+
+    return wp_static_is_valid_generation_token((string) $_SERVER['HTTP_X_WP_STATIC_TOKEN']);
+}
+
+/**
+ * Indique qu'une réponse HTTP provient du cache statique (gateway pré-WP ou init).
+ */
+function wp_static_response_is_static_cache($response)
+{
+    if (is_wp_error($response)) {
+        return false;
+    }
+
+    $cache_header = wp_remote_retrieve_header($response, 'x-static-cache');
+    if (!is_string($cache_header) || $cache_header === '') {
+        return false;
+    }
+
+    return stripos($cache_header, 'HIT') !== false;
+}
+
+function wp_static_fetch_url_is_acceptable($response, $is_generation_request)
+{
+    if (is_wp_error($response)) {
+        return false;
+    }
+
+    $status_code = (int) wp_remote_retrieve_response_code($response);
+    if ($status_code >= 500) {
+        return false;
+    }
+
+    if ($is_generation_request && wp_static_response_is_static_cache($response)) {
+        return false;
+    }
+
+    return true;
 }
 
 function wp_static_maybe_collect_dependencies()
@@ -5487,6 +6269,7 @@ function wp_static_maybe_collect_dependencies()
     }
     $GLOBALS['wp_static_collected_ids'] = [];
     add_action('the_post', 'wp_static_collect_post_id');
+    add_filter('status_header', 'wp_static_error_page_generation_status_header', 10, 2);
 
     // Pendant la génération, on ne suit pas les redirections WordPress
     // (canonique, ancien slug). Une URL canonique qui redirige n'a pas de
@@ -5559,6 +6342,7 @@ function wp_static_append_deps_marker($buffer)
  */
 if (wp_static_is_enabled()) {
     add_action('init', 'wp_static_serve_static_page', 1);
+    add_action('template_redirect', 'wp_static_serve_error_page_on_404', 1);
 }
 
 function wp_static_serve_static_page()

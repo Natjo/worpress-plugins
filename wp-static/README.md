@@ -68,20 +68,20 @@ l'administrateur utilise le bouton **Générer les pages statiques**.
 Dans l'onglet **Paramètres**, un menu **« Mode de régénération »** propose trois modes :
 
 - **Manuel** : **aucune** page n'est régénérée automatiquement et la tâche planifiée est suspendue. Toute modification marque le site « à régénérer » et affiche la **notice rouge** + l'indicateur rouge dans la barre d'admin. La mise à jour se fait via le bouton **Générer** ou les boutons **Régénérer** par ligne.
-- **Automatique (ciblé)** *(par défaut)* : seules les **pages impactées** sont régénérées à chaque modification de contenu (comportement décrit dans [Mise à jour automatique](#mise-à-jour-automatique)). Recommandé pour la plupart des sites.
-- **Complet** : l'**intégralité du site** est régénérée à **chaque** événement automatique qui affecte le front public (sauvegarde d'un contenu publié, publication, suppression, commentaire, terme…). Les boutons **Régénérer** par ligne restent ciblés. Simple et toujours à jour, idéal pour les **petits sites** au contenu peu changeant — à éviter sur les gros sites car le coût croît avec le nombre de pages.
+- **Automatique** *(par défaut)* : seules les **pages impactées** sont régénérées à chaque modification de contenu (comportement décrit dans [Mise à jour automatique](#mise-à-jour-automatique)). Recommandé pour la plupart des sites.
+- **Full** : l'**intégralité du site** est régénérée à **chaque** événement automatique qui affecte le front public (sauvegarde d'un contenu publié, publication, suppression, commentaire, terme…). Les boutons **Régénérer** par ligne restent ciblés. Simple et toujours à jour, idéal pour les **petits sites** au contenu peu changeant — à éviter sur les gros sites car le coût croît avec le nombre de pages.
 
 La case **« Servir le site statique aux utilisateurs connectés »** contrôle le
 cookie de connexion WordPress dans les modes Manuel et Automatique. En mode
-**Complet**, elle est activée de force et désactivée dans l’interface : le front
+**Full**, elle est activée de force et désactivée dans l’interface : le front
 reste statique même lorsque l’administrateur est connecté. `/wp-admin`, la
 connexion, les prévisualisations et toutes les URLs avec paramètres restent
 dynamiques. Les cookies de commentaire et de page protégée (`comment_author`,
 `wp-postpass`) continuent toujours à contourner le cache.
 
-> Les deux champs ci-dessous (URLs forcées et classes) ainsi que la colonne « Dépend de » du tableau ne s'affichent qu'en mode **Automatique (ciblé)** : ils sont inutiles en mode Manuel (rien d'auto) comme en mode Complet (tout est déjà régénéré).
+> Les deux champs ci-dessous (URLs forcées et classes) ainsi que la colonne « Dépend de » du tableau ne s'affichent qu'en mode **Automatique** : ils sont inutiles en mode Manuel (rien d'auto) comme en mode Full (tout est déjà régénéré). Ils se règlent dans **Paramètres → Génération avancée** (même bouton d’enregistrement que le cron et les exclusions par motif).
 
-En mode **Automatique (ciblé)**, deux champs permettent de couvrir les pages que la carte de dépendances ne peut pas deviner (accueil « magazine », plan du site, listing à requête personnalisée…). Les URLs « non statique »/exclues sont ignorées à la génération.
+En mode **Automatique**, deux champs permettent de couvrir les pages que la carte de dépendances ne peut pas deviner (accueil « magazine », plan du site, listing à requête personnalisée…). Les URLs « non statique »/exclues sont ignorées à la génération.
 
 - **« URLs à toujours régénérer »** (une entrée par ligne) : régénérées **à chaque enregistrement de contenu**, en plus des pages détectées automatiquement. Chaque ligne peut être :
   - une **URL complète** du site (seules les URLs du même hôte sont conservées) ;
@@ -96,9 +96,10 @@ Dans l'onglet **Paramètres**, une case **« Minification »** : si activée, le
 
 La section **Génération avancée** ajoute :
 
-- **Purger les fichiers orphelins** : après une génération complète, supprime les anciens fichiers `index.html` qui ne correspondent plus à une URL collectée (page supprimée, slug changé, type masqué, motif exclu…).
-- **Régénération planifiée** : choix entre désactivée, deux fois par jour, quotidienne ou hebdomadaire. Elle est active dans les modes Automatique et Complet, suspendue en mode Manuel, et sa fréquence reste mémorisée lors d'un changement de mode.
+- **Régénération planifiée** : choix entre désactivée, deux fois par jour, quotidienne ou hebdomadaire. Elle est active dans les modes Automatique et Full, suspendue en mode Manuel, et sa fréquence reste mémorisée lors d'un changement de mode.
 - **Exclusions par motif** : un motif par ligne, avec `*` supporté (ex. `/feed/*`, `*/preview/*`, `https://example.com/private/*`). Les motifs sont testés sur l'URL complète et sur le chemin.
+- **URLs à toujours régénérer** et **Classes déclenchant une régénération** (visibles en mode Automatique uniquement) : voir ci-dessus.
+- Un seul bouton **Enregistrer les paramètres avancés** pour toute la section.
 
 > L'interface est organisée en onglets : **Statique** (activation + génération + cache + tableau des pages), **Paramètres** (régénération auto, minification, génération avancée, htaccess préprod) et **Export** (téléchargement ZIP du site statique).
 
@@ -228,7 +229,7 @@ if (is_file($wpsc_service)) {
 ```
 
 Le second argument est réinjecté automatiquement à `true` lorsque le réglage
-l’autorise ou lorsque le mode Complet le force.
+l’autorise ou lorsque le mode Full le force.
 
 - Activé via le toggle **« Activer le site statique »** : le bloc est inséré entre les marqueurs `/* wp-static-cache:start */` … `/* wp-static-cache:end */`.
 - Désactivé : le bloc est retiré automatiquement (et aussi à la **désactivation du plugin**).
@@ -240,7 +241,7 @@ Garde-fous du bloc injecté :
 - uniquement les requêtes **GET**, **sans chaîne de requête** ;
 - jamais pour `/wp-admin`, `/wp-login`, `/wp-json`, `/wp-cron`, `/xmlrpc` ;
 - le cookie `wordpress_logged_in` contourne le cache selon l’option dédiée, sauf
-  en mode Complet où le front statique est toujours servi ;
+  en mode Full où le front statique est toujours servi ;
 - jamais pour une page personnalisée par `comment_author` ou `wp-postpass`,
   aussi bien dans le service pré-WordPress que dans son fallback WordPress ;
 - jamais pendant une **génération** lorsque l’en-tête `X-WP-Static-Token`
@@ -263,7 +264,7 @@ Le service PHP décrit ci‑dessus économise le rendu mais charge quand même W
 
 > Important : ces exemples de configuration serveur ne peuvent pas lire le mode
 > stocké dans WordPress. Ils conservent donc par défaut le rendu dynamique pour
-> les utilisateurs connectés. Pour reproduire le mode Complet du plugin,
+> les utilisateurs connectés. Pour reproduire le mode Full du plugin,
 > retirez uniquement la condition `wordpress_logged_in` ; conservez les gardes
 > sur la méthode, les paramètres et l’administration.
 
@@ -356,7 +357,7 @@ pour la **fin de requête**. En mode Automatique, il cible :
 - ses **listings naturels** : accueil, archive de son type de contenu, archives de ses taxonomies, et leurs paginations ;
 - pour un contenu **hiérarchique** (page, CPT hiérarchique) : la **page parente et ses ancêtres** (qui affichent souvent une liste de leurs enfants).
 
-En mode Complet, ces calculs ciblés sont ignorés : une seule demande complète est
+En mode Full, ces calculs ciblés sont ignorés : une seule demande complète est
 mémorisée pour la requête et la liste des URLs n'est collectée qu'au moment de
 son traitement.
 
@@ -382,7 +383,7 @@ déclenchent aucune génération.
 
 Certains changements ont un impact **global** non devinable. Dans les modes
 Manuel et Automatique, le plugin pose alors un drapeau et affiche une notice
-d'administration invitant à régénérer le site. En mode Complet, ils déclenchent
+d'administration invitant à régénérer le site. En mode Full, ils déclenchent
 directement une génération complète. Déclencheurs :
 
 - modification d'un **menu** ;
@@ -398,7 +399,7 @@ directement une génération complète. Déclencheurs :
 
 Le drapeau est effacé après une génération complète.
 
-La notice apparaît **en rouge**. Un indicateur **WP Static** est aussi présent dans la **barre d'administration** (header) : vert = service actif, gris = service désactivé, **rouge = régénération nécessaire**.
+La notice apparaît **en rouge**. Un indicateur **WP Static** est aussi présent dans la **barre d'administration** (header) lorsque le service est **activé** : vert = OK, **rouge = régénération nécessaire**. Si le service est désactivé, ni la notice ni l’entrée dans la barre d’admin ne s’affichent.
 
 ---
 
@@ -522,7 +523,7 @@ Si WPML est absent, le comportement reste inchangé.
 
 ## Tâche planifiée (cron)
 
-L'événement `wp_static_daily_regeneration` régénère intégralement le site comme filet de sécurité pour rattraper tout changement non détecté (imports SQL directs, WP-CLI, etc.). Sa fréquence est configurable dans **Paramètres → Génération avancée** : désactivée, deux fois par jour, quotidienne ou hebdomadaire. Il est planifié dans les modes Automatique et Complet, suspendu en mode Manuel, puis retiré à la désactivation du plugin.
+L'événement `wp_static_daily_regeneration` régénère intégralement le site comme filet de sécurité pour rattraper tout changement non détecté (imports SQL directs, WP-CLI, etc.). Sa fréquence est configurable dans **Paramètres → Génération avancée** : désactivée, deux fois par jour, quotidienne ou hebdomadaire. Il est planifié dans les modes Automatique et Full, suspendu en mode Manuel, puis retiré à la désactivation du plugin.
 
 ---
 
@@ -593,6 +594,19 @@ add_filter( 'wp_static_urls', function ( $urls ) {
 
 ## Notes de version
 
+### 1.2.4 — 28 août 2026
+
+- Renommage des modes de régénération : **Automatique** (pages impactées) et
+  **Full** (site entier) ; le macaron d’état reste visible sous le titre.
+- Textes d’explication des modes déplacés sous le select dans **Paramètres**.
+- Regroupement dans **Génération avancée** des champs « URLs à toujours
+  régénérer » et « Classes déclenchant une régénération », avec un seul bouton
+  d’enregistrement (cron, exclusions, URLs et classes).
+- Précisions des interrupteurs (utilisateurs connectés, minification, purge des
+  orphelins) en parenthèses après le libellé ; messages de succès retirés.
+- Au retour sur l’onglet **Statique** après un changement de mode qui affecte
+  la colonne « Dépend de », la liste est rechargée automatiquement.
+
 ### 1.2.3 — 24 juillet 2026
 
 - Correction de l’affichage des interrupteurs désactivés dans l’administration :
@@ -602,7 +616,7 @@ add_filter( 'wp_static_urls', function ( $urls ) {
 
 - Ajout du réglage permettant de servir le statique aux utilisateurs connectés
   dans les modes Manuel et Automatique.
-- En mode Complet, le front statique est désormais forcé pour les utilisateurs
+- En mode Full, le front statique est désormais forcé pour les utilisateurs
   connectés, directement depuis le service pré-WordPress ; l’administration,
   les prévisualisations, les URLs avec paramètres et les cookies réellement
   privés restent dynamiques.
@@ -630,7 +644,7 @@ add_filter( 'wp_static_urls', function ( $urls ) {
   propagation lors des redirections.
 - Désactivation rapide et réversible : le service et les tâches sont arrêtés,
   tandis que le cache reste disponible jusqu'à sa suppression explicite.
-- Cohérence des modes Manuel, Automatique et Complet : cron réellement suspendu
+- Cohérence des modes Manuel, Automatique et Full : cron réellement suspendu
   en mode Manuel, actions par ligne toujours ciblées et collecte complète
   reportée au traitement de la file.
 
