@@ -13,7 +13,7 @@ Conversion via **Imagick**, avec profils de qualité et détection automatique d
 
 1. **Réglages → WP WebP** : choisir un profil de qualité (Best / Optimal / Green).
 2. Activer ou désactiver la génération WebP par format d’image enregistré.
-3. **Générer les WebP** : régénère toute la médiathèque (original + formats activés), un attachement et toutes ses déclinaisons par requête AJAX. Le bouton devient **Pause**, puis **Reprendre**, sans perdre la progression.
+3. **Générer les WebP** : régénère toute la médiathèque (original + formats activés) par requête AJAX. Un attachement est traité d’un bloc tant qu’il tient dans le budget de temps du lot, sinon il reprend à la déclinaison suivante au tour d’après. Le bouton devient **Pause**, puis **Reprendre**, sans perdre la progression.
 4. Les WebP sont aussi créés automatiquement à l’**upload** et via **Regenerate Thumbnails**.
 
 Convention de nommage : `photo.jpg` → `photo.webp` (l’extension est remplacée, pas ajoutée).
@@ -87,10 +87,47 @@ du resize Imagick.
   mélanger leur progression.
 - La suppression globale est asynchrone et reprend son parcours de dossiers
   entre les requêtes AJAX, ce qui évite un timeout sur un gros dossier `uploads`.
+- Chaque requête de génération dispose d’un budget de **15 secondes**, ajustable
+  avec le filtre `wp_webp_batch_time_budget`. La limite qui compte n’est pas
+  `max_execution_time` mais celle du serveur web : au-delà, Apache renvoie sa
+  propre page 500 et la réponse JSON est perdue. Le budget est vérifié entre
+  deux déclinaisons et au moins une est toujours traitée par requête.
+
+## Échec serveur pendant la génération
+
+Si une requête ne renvoie pas de JSON (page 500 HTML d’Apache, connexion
+coupée), l’interface ne s’arrête plus au premier incident :
+
+1. le même lot est rejoué jusqu’à trois fois, à deux secondes d’intervalle ;
+2. si l’échec persiste, le client demande au serveur d’ignorer cet attachement
+   (`skip_attachment`) et transmet le message d’origine ;
+3. l’attachement est journalisé dans `error_log` et compté comme erreur, ce qui
+   empêche la mise à jour de la date de dernière génération ;
+4. le parcours continue sur les médias suivants et le rapport final nomme les
+   images ignorées.
+
+Un média systématiquement ignoré signale un problème serveur sur ce fichier
+précis : décodage trop lourd pour la mémoire d’ImageMagick, ou temps de
+conversion supérieur au délai du serveur web. Le message conservé dans le
+rapport et dans `error_log` permet de l’identifier.
 
 ---
 
 ## Notes de version
+
+### 1.1.6 — 2026-08-31
+
+**Robustesse**
+- Budget de temps par requête de génération (15 s, filtre
+  `wp_webp_batch_time_budget`). Un attachement lourd est réparti sur plusieurs
+  lots au lieu de dépasser le délai du serveur web et de provoquer une page 500.
+- Le curseur reprend à la déclinaison suivante du même attachement ; une image
+  n’est comptée comme traitée que lorsque toutes ses déclinaisons sont faites.
+- L’interface rejoue un lot en échec jusqu’à trois fois, puis fait ignorer
+  l’attachement fautif par le serveur au lieu d’interrompre le run. Le message
+  d’erreur d’origine est conservé dans le rapport et dans `error_log`.
+- Le décodage par fichier des très grandes sources passe par la même boucle que
+  le décodage partagé, donc par le même budget de temps.
 
 ### 1.1.5 — 2026-08-30
 
