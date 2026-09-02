@@ -6,13 +6,14 @@ Conversion via **Imagick**, avec profils de qualité et détection automatique d
 
 ## Prérequis
 
+- PHP **8.0 minimum**
 - PHP avec l’extension **Imagick**
 - ImageMagick avec support du format **WebP**
 
 ## Utilisation
 
-1. **Réglages → WP WebP** : choisir un profil de qualité (Best / Optimal / Green).
-2. Activer ou désactiver la génération WebP par format d’image enregistré.
+1. **Réglages → WP WebP** : choisir un profil de qualité (Finest / Natural / Optimal / Green).
+2. Activer ou désactiver la génération WebP par format (`original` + formats enregistrés).
 3. **Générer les WebP** : régénère toute la médiathèque (original + formats activés) par requête AJAX. Un attachement est traité d’un bloc tant qu’il tient dans le budget de temps du lot, sinon il reprend à la déclinaison suivante au tour d’après. Le bouton devient **Pause**, puis **Reprendre**, sans perdre la progression.
 4. Les WebP sont aussi créés automatiquement à l’**upload** et via **Regenerate Thumbnails**.
 
@@ -27,10 +28,16 @@ JPG/PNG source n’est pas modifié et les déclinaisons conservent les dimensio
 et cadrages calculés par WordPress. Le filtre `wp_webp_max_full_dimension`
 permet d’ajuster cette limite (`0` la désactive).
 
-La désactivation d’un format supprime progressivement ses anciens WebP par lots
-de 100 attachements. La suppression globale parcourt `uploads` par lots de
-250 entrées et conserve toujours les médias WebP téléversés directement ainsi
-que leurs déclinaisons.
+La désactivation d’un format (case **Compresser**) n’efface plus ses WebP.
+Utilisez **Effacer les WebP des formats non utilisés** (section Developer) pour
+supprimer ceux des formats décochés. La suppression globale parcourt `uploads`
+par lots de 250 entrées et conserve toujours les médias WebP téléversés
+directement ainsi que leurs déclinaisons.
+
+La section **Developer** permet aussi de masquer le format `original` dans la
+liste. Lorsqu’il est masqué, sa génération est forcée et il reste toujours
+actif. Lorsqu’il est affiché, sa case **Compresser** permet de l’activer ou de le
+désactiver comme les autres formats.
 
 ## WordPress et ACF
 
@@ -49,6 +56,18 @@ docker compose -f .docker/docker-compose.yml exec -T wordpress \
   php /var/www/html/wp-content/plugins/wp-webp/tests/wp-webp-lifecycle.php
 ```
 
+Le contrat de l’interface d’administration génère une fixture temporaire à
+ouvrir dans un vrai navigateur :
+
+```bash
+docker compose -f .docker/docker-compose.yml exec -T wordpress \
+  php /var/www/html/wp-content/plugins/wp-webp/tests/wp-webp-admin-browser-contract.php \
+  /tmp/wp-webp-admin-browser-contract.html
+docker compose -f .docker/docker-compose.yml cp \
+  wordpress:/tmp/wp-webp-admin-browser-contract.html \
+  /tmp/wp-webp-admin-browser-contract.html
+```
+
 ## Détection graphique (near-lossless)
 
 Pour les JPG et PNG contenant peu de couleurs distinctes (illustrations, logos, aplats), le plugin encode en **WebP near-lossless** afin de préserver les bords nets. Les photos (nombreuses couleurs) restent en WebP lossy classique.
@@ -57,11 +76,12 @@ L’analyse est effectuée **une fois par image source** (cache par attachement)
 
 ## Profils
 
-| Profil | Photo lossy | Graphique near-lossless |
-| --- | ---: | ---: |
-| Best | 85 | 85 |
-| Optimal | 75 | 55 |
-| Green | 68 | 40 |
+| Profil | Photo lossy | Graphique near-lossless | Sharpen |
+| --- | ---: | ---: | :---: |
+| Finest | 85 | 85 | oui |
+| Natural | 80 | 70 | non |
+| Optimal | 75 | 55 | oui |
+| Green | 68 | 40 | oui |
 
 Si un graphique near-lossless est plus lourd que son fallback JPG/PNG, le
 plugin réessaie en lossy puis réduit progressivement la qualité jusqu’au
@@ -83,10 +103,13 @@ du resize Imagick.
 - La génération globale compte les attachements avec une requête SQL légère :
   elle ne charge plus les métadonnées de toute la médiathèque au démarrage.
 - Chaque lancement possède sa propre session temporaire, isolée par utilisateur
-  et par exécution. Deux administrateurs peuvent donc lancer une génération sans
-  mélanger leur progression.
+  et par exécution. Un verrou global empêche deux générations manuelles de
+  solliciter simultanément PHP-FPM et d’écrire les mêmes fichiers.
 - La suppression globale est asynchrone et reprend son parcours de dossiers
-  entre les requêtes AJAX, ce qui évite un timeout sur un gros dossier `uploads`.
+  entre les requêtes AJAX. Les entrées d’un dossier sont mémorisées pendant le
+  run pour ne pas rescanner les mêmes fichiers à chaque lot.
+- Les fichiers temporaires `.wp-webp-*` abandonnés depuis plus d’une heure après
+  un crash sont nettoyés progressivement lors des traitements suivants.
 - Chaque requête de génération dispose d’un budget de **15 secondes**, ajustable
   avec le filtre `wp_webp_batch_time_budget`. La limite qui compte n’est pas
   `max_execution_time` mais celle du serveur web : au-delà, Apache renvoie sa
@@ -114,6 +137,96 @@ rapport et dans `error_log` permet de l’identifier.
 ---
 
 ## Notes de version
+
+### 1.2.0 — 2026-09-02
+
+**Réglages**
+- Nouvelle case Developer pour afficher ou masquer le format `original`. Masqué,
+  il reste systématiquement généré ; affiché, il peut être sélectionné ou non.
+
+**Sécurité**
+- Les contrats PHP refusent toute exécution HTTP et restent réservés à la CLI.
+- Le prérequis PHP 8.0 est déclaré dans l’en-tête du plugin.
+
+**Robustesse**
+- Verrou global avec expiration pour empêcher deux générations ou nettoyages
+  concurrents ; libération à la fin, à l’abandon et sur exception. Les réglages
+  de profil et de formats sont bloqués pendant ces opérations.
+- Nettoyage borné des fichiers temporaires anciens laissés par un crash fatal.
+- Attribution des exceptions inattendues au format pointé par le curseur.
+
+**Performance**
+- Parcours linéaire des dossiers pendant la suppression globale, sans nouveau
+  `scandir()` à chaque lot.
+- Chargement unique des métadonnées d’un attachement lors du nettoyage de
+  plusieurs formats désactivés.
+- Boucles AJAX itératives et aperçu des erreurs borné côté navigateur.
+
+### 1.1.15 — 2026-09-02
+
+**Interface**
+- La colonne **Erreurs** affiche `—` sans erreur, sinon un compteur et le lien
+  **Afficher**.
+
+**Robustesse**
+- Après l’abandon d’un attachement en échec serveur, l’erreur est attribuée au
+  format pointé par le curseur au lieu d’être systématiquement rattachée à
+  `original`.
+- Le contrat automatisé préserve le journal d’erreurs existant.
+
+### 1.1.14 — 2026-09-02
+
+**Interface**
+- Choix du profil de qualité via un **select** (plus de radios).
+
+### 1.1.13 — 2026-09-02
+
+**Interface**
+- Profil **Best** renommé **Finest** (l’ancien réglage `best` est migré
+  automatiquement).
+- Nouveau profil **Natural** (qualité 80, sans sharpen), entre Finest et Optimal.
+
+### 1.1.12 — 2026-09-02
+
+**Robustesse**
+- Si `image_resize_dimensions()` refuse le resize (taille déjà OK ou upscale
+  interdit par WordPress), le WebP est encodé tel quel au lieu d’échouer avec
+  « Calcul des dimensions WordPress impossible ».
+
+### 1.1.11 — 2026-09-02
+
+**Interface**
+- Colonne **Erreurs** (`—` sans erreur, sinon compteur + bouton **Afficher**)
+  dans la liste des formats.
+- Modale listant les échecs du dernier run pour ce format (journal plafonné).
+
+### 1.1.10 — 2026-09-01
+
+**Interface**
+- Décocher **Compresser** n’efface plus les WebP : l’option est seulement
+  ignorée à la génération / à l’upload.
+- Nouveau bouton **Effacer les WebP des formats non utilisés** sous
+  **Effacer tous les WebP des uploads**.
+
+### 1.1.9 — 2026-09-01
+
+**Interface**
+- Confirmer **Quitter la page** pendant une génération annule le run (curseur
+  effacé, transient serveur supprimé). Rester sur la page continue normalement.
+
+### 1.1.8 — 2026-09-01
+
+**Interface**
+- Alerte navigateur si on ferme ou recharge la page pendant une génération
+  (y compris en pause).
+- Le curseur de génération est conservé en `sessionStorage` tant que la page
+  reste ouverte (pause / Reprendre).
+
+### 1.1.7 — 2026-09-01
+
+**Interface**
+- Ligne **original** réintroduite en tête de la liste des formats, avec case
+  **Compresser** (désactivation = nettoyage des WebP pleine taille).
 
 ### 1.1.6 — 2026-08-31
 

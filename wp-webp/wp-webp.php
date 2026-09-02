@@ -2,7 +2,8 @@
 /**
  * Plugin Name: WP WebP
  * Description: Génère une version WebP de chaque image téléversée (et de toutes ses déclinaisons add_image_size), compatible Regenerate Thumbnails. Conversion via Imagick avec détection graphique near-lossless.
- * Version: 1.1.6
+ * Version: 1.2.0
+ * Requires PHP: 8.0
  * Author: Lonsdale studio
  */
 
@@ -10,10 +11,16 @@ if (!defined('ABSPATH')) exit;
 
 define('WP_WEBP_PROFILE_OPTION', 'wp_webp_profile');
 define('WP_WEBP_DISABLED_SIZES_OPTION', 'wp_webp_disabled_sizes');
+define('WP_WEBP_SHOW_ORIGINAL_OPTION', 'wp_webp_show_original');
 define('WP_WEBP_SIZE_GENERATED_OPTION', 'wp_webp_size_generated_at');
+define('WP_WEBP_SIZE_ERRORS_OPTION', 'wp_webp_size_errors');
+define('WP_WEBP_OPERATION_LOCK_OPTION', 'wp_webp_operation_lock');
 define('WP_WEBP_ORIGINAL_SIZE', 'original');
 define('WP_WEBP_MAX_FULL_DIMENSION', 2500);
 define('WP_WEBP_BATCH_TIME_BUDGET', 15);
+define('WP_WEBP_SIZE_ERRORS_LIMIT', 200);
+define('WP_WEBP_OPERATION_LOCK_TTL', HOUR_IN_SECONDS);
+define('WP_WEBP_TEMP_FILE_MAX_AGE', HOUR_IN_SECONDS);
 
 /**
  * Dimension maximale du côté le plus long pour le WebP pleine taille.
@@ -55,6 +62,150 @@ function wp_webp_format_generated_at($timestamp) {
 }
 
 /**
+ * Erreurs de génération batch indexées par format.
+ *
+ * @return array<string, array<int, array{file:string,error:string}>>
+ */
+function wp_webp_get_size_errors_map() {
+    $map = get_option(WP_WEBP_SIZE_ERRORS_OPTION, []);
+    return is_array($map) ? $map : [];
+}
+
+/**
+ * @return array<int, array{file:string,error:string}>
+ */
+function wp_webp_get_size_errors($size) {
+    $map = wp_webp_get_size_errors_map();
+    $size = (string) $size;
+    return isset($map[$size]) && is_array($map[$size]) ? array_values($map[$size]) : [];
+}
+
+function wp_webp_get_size_error_count($size) {
+    return count(wp_webp_get_size_errors($size));
+}
+
+/**
+ * @param string[] $sizes
+ */
+function wp_webp_clear_size_errors(array $sizes) {
+    $sizes = array_values(array_unique(array_filter(array_map('strval', $sizes))));
+    if ($sizes === []) {
+        return;
+    }
+
+    $map = wp_webp_get_size_errors_map();
+    $changed = false;
+    foreach ($sizes as $size) {
+        if (isset($map[$size])) {
+            unset($map[$size]);
+            $changed = true;
+        }
+    }
+
+    if ($changed) {
+        update_option(WP_WEBP_SIZE_ERRORS_OPTION, $map, false);
+    }
+}
+
+/**
+ * Ajoute des échecs au journal par format (plafonné par taille).
+ *
+ * @param array<int, array{file?:string,error?:string,size?:string}> $failures
+ */
+function wp_webp_append_size_errors(array $failures) {
+    if ($failures === []) {
+        return;
+    }
+
+    $map = wp_webp_get_size_errors_map();
+    $limit = max(1, (int) apply_filters('wp_webp_size_errors_limit', WP_WEBP_SIZE_ERRORS_LIMIT));
+    $changed = false;
+
+    foreach ($failures as $failure) {
+        if (!is_array($failure)) {
+            continue;
+        }
+
+        $size = isset($failure['size']) ? (string) $failure['size'] : '';
+        if ($size === '') {
+            continue;
+        }
+
+        if (!isset($map[$size]) || !is_array($map[$size])) {
+            $map[$size] = [];
+        }
+
+        $map[$size][] = [
+            'file'  => (string) ($failure['file'] ?? 'fichier inconnu'),
+            'error' => (string) ($failure['error'] ?? 'Conversion impossible'),
+        ];
+
+        if (count($map[$size]) > $limit) {
+            $map[$size] = array_slice($map[$size], -$limit);
+        }
+
+        $changed = true;
+    }
+
+    if ($changed) {
+        update_option(WP_WEBP_SIZE_ERRORS_OPTION, $map, false);
+    }
+}
+
+/**
+ * Formats concernés par un run (pour reset des erreurs / dates).
+ *
+ * @return string[]
+ */
+function wp_webp_sizes_for_generation_scope($only_size = '') {
+    $only_size = wp_webp_sanitize_only_size($only_size);
+    if ($only_size !== '') {
+        return [$only_size];
+    }
+
+    $sizes = [];
+    if (wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE)) {
+        $sizes[] = WP_WEBP_ORIGINAL_SIZE;
+    }
+    foreach (array_keys(wp_webp_get_image_sizes()) as $name) {
+        if (wp_webp_size_enabled($name)) {
+            $sizes[] = $name;
+        }
+    }
+
+    return $sizes;
+}
+
+/**
+ * Compteurs d’erreurs pour l’UI (tous les formats gérés).
+ *
+ * @return array<string,int>
+ */
+function wp_webp_get_size_error_counts() {
+    $counts = [];
+    foreach (wp_webp_sizes_for_generation_scope('') as $size) {
+        $counts[$size] = wp_webp_get_size_error_count($size);
+    }
+    // Inclure aussi les formats désactivés qui ont encore un journal.
+    foreach (array_keys(wp_webp_get_size_errors_map()) as $size) {
+        if (!isset($counts[$size])) {
+            $counts[$size] = wp_webp_get_size_error_count($size);
+        }
+    }
+    // Toujours exposer original même s’il est désactivé sans erreur.
+    if (!isset($counts[WP_WEBP_ORIGINAL_SIZE])) {
+        $counts[WP_WEBP_ORIGINAL_SIZE] = wp_webp_get_size_error_count(WP_WEBP_ORIGINAL_SIZE);
+    }
+    foreach (array_keys(wp_webp_get_image_sizes()) as $name) {
+        if (!isset($counts[$name])) {
+            $counts[$name] = wp_webp_get_size_error_count($name);
+        }
+    }
+
+    return $counts;
+}
+
+/**
  * Enregistre la date de fin de génération pour un ou plusieurs formats.
  *
  * @param string[] $sizes
@@ -88,19 +239,7 @@ function wp_webp_touch_size_generated(array $sizes) {
  * Marque la fin d’un run AJAX (format ciblé ou original + formats activés).
  */
 function wp_webp_mark_generation_complete($only_size = '') {
-    $only_size = wp_webp_sanitize_only_size($only_size);
-    if ($only_size !== '') {
-        return wp_webp_touch_size_generated([$only_size]);
-    }
-
-    $sizes = [WP_WEBP_ORIGINAL_SIZE];
-    foreach (array_keys(wp_webp_get_image_sizes()) as $name) {
-        if (wp_webp_size_enabled($name)) {
-            $sizes[] = $name;
-        }
-    }
-
-    return wp_webp_touch_size_generated($sizes);
+    return wp_webp_touch_size_generated(wp_webp_sizes_for_generation_scope($only_size));
 }
 
 function wp_webp_generation_completion($only_size, $failure_count) {
@@ -118,65 +257,90 @@ function wp_webp_generation_completion($only_size, $failure_count) {
 /**
  * Profils de qualité. Chaque profil règle :
  * - quality : qualité de compression WebP (0-100) ;
- * - sharpen : sigma passé à Imagick::sharpenImage (0 = pas d'accentuation) ;
+ * - sigma   : accentuation Imagick::sharpenImage (0 = pas d'accentuation) ;
  * - method  : effort de compression WebP (0-6, 6 = meilleure compression).
  *
- * Best    : qualité maximale, accentuation marquée (fichiers plus lourds).
+ * Finest  : qualité maximale, accentuation marquée (fichiers plus lourds).
+ * Natural : haute qualité sans sharpen.
  * Optimal : meilleur compromis qualité / poids (recommandé).
  * Green   : poids minimal, accentuation légère (fichiers très légers).
  */
 function wp_webp_profiles() {
     return [
-        'best' => [
-            'label'          => 'Best',
-            'desc'           => '',
-            'quality'        => 85,
-            'radius'         => 0,
-            'sigma'          => 0.8,
-            'blur'           => 0.8,
-            'filter'         => 'lanczos',
-            'method'         => 6,
-            'near_lossless'  => 85,
-            'graphic_colors' => 8192,
+        'finest' => [
+            'label'           => 'Finest',
+            'desc'            => 'Qualité maximale, accentuation marquée (fichiers plus lourds).',
+            'quality'         => 85,
+            'radius'          => 0,
+            'sigma'           => 0.8,
+            'blur'            => 0.8,
+            'filter'          => 'lanczos',
+            'method'          => 6,
+            'near_lossless'   => 85,
+            'graphic_colors'  => 8192,
             'cap_to_original' => true,
             'quality_floor'   => 70,
         ],
+        'natural' => [
+            'label'           => 'Natural',
+            'desc'            => 'Haute qualité sans accentuation.',
+            'quality'         => 80,
+            'radius'          => 0,
+            'sigma'           => 0,
+            'blur'            => 0.95,
+            'filter'          => 'lanczos',
+            'method'          => 6,
+            'near_lossless'   => 70,
+            'graphic_colors'  => 8192,
+            'cap_to_original' => true,
+            'quality_floor'   => 60,
+        ],
         'optimal' => [
-            'label'          => 'Optimal',
-            'desc'           => '',
-            'quality'        => 75,
-            'radius'         => 0,
-            'sigma'          => 0.6,
-            'blur'           => 0.9,
-            'filter'         => 'lanczos',
-            'method'         => 6,
-            'near_lossless'  => 55,
-            'graphic_colors' => 8192,
+            'label'           => 'Optimal',
+            'desc'            => 'Meilleur compromis qualité / poids (recommandé).',
+            'quality'         => 75,
+            'radius'          => 0,
+            'sigma'           => 0.6,
+            'blur'            => 0.9,
+            'filter'          => 'lanczos',
+            'method'          => 6,
+            'near_lossless'   => 55,
+            'graphic_colors'  => 8192,
             'cap_to_original' => true,
             'quality_floor'   => 55,
         ],
         'green' => [
-            'label'          => 'Green',
-            'desc'           => '',
-            'quality'        => 68,
-            'radius'         => 0,
-            'sigma'          => 0.5,
-            'blur'           => 1.0,
-            'filter'         => 'triangle',
-            'method'         => 6,
-            'near_lossless'  => 40,
-            'graphic_colors' => 8192,
+            'label'           => 'Green',
+            'desc'            => 'Poids minimal, accentuation légère (fichiers très légers).',
+            'quality'         => 68,
+            'radius'          => 0,
+            'sigma'           => 0.5,
+            'blur'            => 1.0,
+            'filter'          => 'triangle',
+            'method'          => 6,
+            'near_lossless'   => 40,
+            'graphic_colors'  => 8192,
             'cap_to_original' => true,
             'quality_floor'   => 45,
         ],
     ];
 }
 
-function wp_webp_get_profile_key() {
-    $key = (string) get_option(WP_WEBP_PROFILE_OPTION, 'optimal');
-    $profiles = wp_webp_profiles();
+/**
+ * Normalise une clé de profil (dont l’ancien alias `best` → `finest`).
+ */
+function wp_webp_normalize_profile_key($value) {
+    $value = is_string($value) ? $value : '';
+    if ($value === 'best') {
+        $value = 'finest';
+    }
 
-    return isset($profiles[$key]) ? $key : 'optimal';
+    $profiles = wp_webp_profiles();
+    return isset($profiles[$value]) ? $value : 'optimal';
+}
+
+function wp_webp_get_profile_key() {
+    return wp_webp_normalize_profile_key(get_option(WP_WEBP_PROFILE_OPTION, 'optimal'));
 }
 
 function wp_webp_get_profile() {
@@ -336,7 +500,9 @@ function wp_webp_jobs_for_attachment($attachment_id, $only_size = '') {
     $seen_sizes = [];
 
     if ($only_size === '' || $only_size === WP_WEBP_ORIGINAL_SIZE) {
-        $jobs[] = ['type' => 'original'];
+        if ($only_size === WP_WEBP_ORIGINAL_SIZE || wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE)) {
+            $jobs[] = ['type' => 'original'];
+        }
     }
 
     if ($only_size === WP_WEBP_ORIGINAL_SIZE) {
@@ -414,12 +580,29 @@ function wp_webp_jobs_for_attachment($attachment_id, $only_size = '') {
 }
 
 /**
+ * Nom du format associé à un job de génération.
+ */
+function wp_webp_job_size(array $job, $fallback = '') {
+    if (($job['type'] ?? '') === 'original') {
+        return WP_WEBP_ORIGINAL_SIZE;
+    }
+
+    $name = isset($job['name']) ? (string) $job['name'] : '';
+    return $name !== '' ? $name : (string) $fallback;
+}
+
+/**
  * Génère un seul WebP (original ou déclinaison) pour un attachement.
  */
 function wp_webp_process_job($attachment_id, $job_index, &$failures = null, $only_size = '') {
     $original = get_attached_file($attachment_id);
     if (!$original || !file_exists($original)) {
-        wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, 'Fichier source introuvable');
+        wp_webp_record_failure(
+            $failures,
+            'attachment #' . (int) $attachment_id,
+            'Fichier source introuvable',
+            wp_webp_sanitize_only_size($only_size)
+        );
         return 0;
     }
     if (!wp_webp_attachment_supported($attachment_id, $original)) {
@@ -428,21 +611,30 @@ function wp_webp_process_job($attachment_id, $job_index, &$failures = null, $onl
 
     $jobs = wp_webp_jobs_for_attachment($attachment_id, $only_size);
     if (!isset($jobs[$job_index])) {
-        wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, 'Déclinaison introuvable');
+        wp_webp_record_failure(
+            $failures,
+            'attachment #' . (int) $attachment_id,
+            'Déclinaison introuvable',
+            wp_webp_sanitize_only_size($only_size)
+        );
         return 0;
     }
 
     $job = $jobs[$job_index];
+    $job_size = wp_webp_job_size($job, wp_webp_sanitize_only_size($only_size));
+    $failure_offset = is_array($failures) ? count($failures) : 0;
 
     if ($job['type'] === 'original') {
-        return wp_webp_make_webp($original, 0, 0, false, $original, $failures, $attachment_id);
+        $generated = wp_webp_make_webp($original, 0, 0, false, $original, $failures, $attachment_id);
+        wp_webp_tag_failures($failures, $failure_offset, $job_size);
+        return $generated;
     }
 
     $registered = wp_webp_get_image_sizes();
     $crop = isset($registered[$job['name']]) ? $registered[$job['name']]['crop'] : false;
     $dir = trailingslashit(dirname($original));
 
-    return wp_webp_make_webp(
+    $generated = wp_webp_make_webp(
         $original,
         (int) $job['width'],
         (int) $job['height'],
@@ -451,6 +643,9 @@ function wp_webp_process_job($attachment_id, $job_index, &$failures = null, $onl
         $failures,
         $attachment_id
     );
+    wp_webp_tag_failures($failures, $failure_offset, $job_size);
+
+    return $generated;
 }
 
 /**
@@ -550,9 +745,16 @@ function wp_webp_process_attachment_jobs(
             $variant = wp_webp_variant_for_job($jobs[$index], $original, $directory, $registered);
             $next_index = $index + 1;
             $processed++;
+            $job_size = wp_webp_job_size($jobs[$index]);
+            $failure_offset = is_array($failures) ? count($failures) : 0;
 
             if ($variant === null) {
-                wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, 'Déclinaison invalide');
+                wp_webp_record_failure(
+                    $failures,
+                    'attachment #' . (int) $attachment_id,
+                    'Déclinaison invalide',
+                    $job_size
+                );
                 continue;
             }
 
@@ -567,6 +769,7 @@ function wp_webp_process_attachment_jobs(
                     $near_lossless,
                     $failures
                 );
+                wp_webp_tag_failures($failures, $failure_offset, $job_size);
                 continue;
             }
 
@@ -579,12 +782,19 @@ function wp_webp_process_attachment_jobs(
                 $failures,
                 $attachment_id
             );
+            wp_webp_tag_failures($failures, $failure_offset, $job_size);
         }
     } catch (Throwable $e) {
+        $fallback_size = '';
+        if (isset($jobs[$next_index > 0 ? $next_index - 1 : $start_index])) {
+            $job = $jobs[$next_index > 0 ? $next_index - 1 : $start_index];
+            $fallback_size = wp_webp_job_size($job);
+        }
         wp_webp_record_failure(
             $failures,
             wp_webp_relative_upload_path($original),
-            $e->getMessage()
+            $e->getMessage(),
+            $fallback_size
         );
     } finally {
         if ($source instanceof Imagick) {
@@ -785,7 +995,18 @@ function wp_webp_get_disabled_sizes() {
     return is_array($list) ? $list : [];
 }
 
+/**
+ * L'original reste affiché par défaut pour préserver le comportement existant.
+ */
+function wp_webp_show_original_size() {
+    return get_option(WP_WEBP_SHOW_ORIGINAL_OPTION, '1') !== '0';
+}
+
 function wp_webp_size_enabled($name) {
+    if ($name === WP_WEBP_ORIGINAL_SIZE && !wp_webp_show_original_size()) {
+        return true;
+    }
+
     return !in_array($name, wp_webp_get_disabled_sizes(), true);
 }
 
@@ -825,6 +1046,9 @@ function wp_webp_ajax_save_profile() {
     }
 
     check_ajax_referer('wp_webp_profile_action', 'nonce');
+    if (wp_webp_operation_is_locked()) {
+        wp_send_json_error(['message' => 'Une opération WP WebP est en cours.'], 409);
+    }
 
     $profile = wp_webp_sanitize_profile(isset($_POST['profile']) ? wp_unslash($_POST['profile']) : '');
     update_option(WP_WEBP_PROFILE_OPTION, $profile);
@@ -833,14 +1057,10 @@ function wp_webp_ajax_save_profile() {
 }
 
 function wp_webp_sanitize_profile($value) {
-    $profiles = wp_webp_profiles();
-    $value = is_string($value) ? $value : '';
-
-    return isset($profiles[$value]) ? $value : 'optimal';
+    return wp_webp_normalize_profile_key($value);
 }
 
 add_action('wp_ajax_wp_webp_save_size', 'wp_webp_ajax_save_size');
-add_action('wp_ajax_wp_webp_cleanup_size', 'wp_webp_ajax_cleanup_size');
 
 function wp_webp_ajax_save_size() {
     if (!current_user_can('manage_options')) {
@@ -848,13 +1068,19 @@ function wp_webp_ajax_save_size() {
     }
 
     check_ajax_referer('wp_webp_size_action', 'nonce');
+    if (wp_webp_operation_is_locked()) {
+        wp_send_json_error(['message' => 'Une opération WP WebP est en cours.'], 409);
+    }
 
     $size = isset($_POST['size']) ? sanitize_key(wp_unslash($_POST['size'])) : '';
     $enabled = (isset($_POST['enabled']) && $_POST['enabled'] === '1');
 
-    $valid = array_keys(wp_webp_get_image_sizes());
+    $valid = array_merge([WP_WEBP_ORIGINAL_SIZE], array_keys(wp_webp_get_image_sizes()));
     if ($size === '' || !in_array($size, $valid, true)) {
         wp_send_json_error(['message' => 'Format inconnu.'], 400);
+    }
+    if ($size === WP_WEBP_ORIGINAL_SIZE && !$enabled && !wp_webp_show_original_size()) {
+        wp_send_json_error(['message' => 'Le format original masqué reste toujours actif.'], 409);
     }
 
     $disabled = wp_webp_get_disabled_sizes();
@@ -867,48 +1093,132 @@ function wp_webp_ajax_save_size() {
     update_option(WP_WEBP_DISABLED_SIZES_OPTION, $disabled);
 
     wp_send_json_success([
-        'size'             => $size,
-        'enabled'          => $enabled,
-        'cleanup_required' => !$enabled,
+        'size'    => $size,
+        'enabled' => $enabled,
     ]);
 }
 
-function wp_webp_ajax_cleanup_size() {
+add_action('wp_ajax_wp_webp_save_original_visibility', 'wp_webp_ajax_save_original_visibility');
+
+function wp_webp_ajax_save_original_visibility() {
     if (!current_user_can('manage_options')) {
         wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
     }
 
-    check_ajax_referer('wp_webp_size_action', 'nonce');
-    wp_webp_prepare_batch_environment();
-
-    $size = isset($_POST['size']) ? sanitize_key(wp_unslash($_POST['size'])) : '';
-    $after_id = isset($_POST['after_id']) ? max(0, (int) $_POST['after_id']) : 0;
-    $valid = array_keys(wp_webp_get_image_sizes());
-
-    if ($size === '' || !in_array($size, $valid, true)) {
-        wp_send_json_error(['message' => 'Format inconnu.'], 400);
+    check_ajax_referer('wp_webp_original_visibility_action', 'nonce');
+    if (wp_webp_operation_is_locked()) {
+        wp_send_json_error(['message' => 'Une opération WP WebP est en cours.'], 409);
     }
 
-    if (wp_webp_size_enabled($size)) {
-        wp_send_json_error(['message' => 'Ce format est encore actif.'], 409);
+    $visible = isset($_POST['visible']) && $_POST['visible'] === '1';
+    update_option(WP_WEBP_SHOW_ORIGINAL_OPTION, $visible ? '1' : '0');
+
+    if (!$visible) {
+        $disabled = array_values(array_diff(
+            wp_webp_get_disabled_sizes(),
+            [WP_WEBP_ORIGINAL_SIZE]
+        ));
+        update_option(WP_WEBP_DISABLED_SIZES_OPTION, $disabled);
     }
-
-    $ids = wp_webp_get_attachment_ids_after($after_id, 100);
-    $deleted = 0;
-    $failures = [];
-
-    foreach ($ids as $attachment_id) {
-        $deleted += wp_webp_delete_attachment_size($attachment_id, $size, $failures);
-    }
-
-    $next_after_id = $ids !== [] ? (int) end($ids) : $after_id;
 
     wp_send_json_success([
-        'after_id' => $next_after_id,
-        'deleted'  => $deleted,
-        'done'     => count($ids) < 100,
-        'failures' => $failures,
+        'visible' => $visible,
+        'enabled' => wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE),
     ]);
+}
+
+/**
+ * Formats gérés par le plugin et actuellement désactivés (Compresser décoché).
+ *
+ * @return string[]
+ */
+function wp_webp_get_disabled_managed_sizes() {
+    $sizes = array_merge([WP_WEBP_ORIGINAL_SIZE], array_keys(wp_webp_get_image_sizes()));
+    $disabled = [];
+
+    foreach ($sizes as $name) {
+        if (!wp_webp_size_enabled($name)) {
+            $disabled[] = $name;
+        }
+    }
+
+    return $disabled;
+}
+
+add_action('wp_ajax_wp_webp_cleanup_unused', 'wp_webp_ajax_cleanup_unused');
+
+function wp_webp_ajax_cleanup_unused() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_webp_clear_action', 'nonce');
+    wp_webp_prepare_batch_environment();
+
+    $after_id = isset($_POST['after_id']) ? max(0, (int) $_POST['after_id']) : 0;
+    $run_id = isset($_POST['run_id'])
+        ? strtolower(preg_replace('/[^a-z0-9]/i', '', (string) wp_unslash($_POST['run_id'])))
+        : '';
+    $disabled = wp_webp_get_disabled_managed_sizes();
+
+    if ($disabled === []) {
+        if ($run_id !== '') {
+            wp_webp_release_operation_lock($run_id);
+        }
+        wp_send_json_success([
+            'run_id'  => $run_id,
+            'after_id' => $after_id,
+            'deleted'  => 0,
+            'done'     => true,
+            'empty'    => true,
+            'failures' => [],
+            'sizes'    => [],
+        ]);
+    }
+
+    if ($run_id === '') {
+        if ($after_id > 0) {
+            wp_send_json_error(['message' => 'Session de nettoyage invalide.'], 400);
+        }
+        $run_id = strtolower(wp_generate_password(20, false, false));
+        if (!wp_webp_acquire_operation_lock($run_id)) {
+            wp_send_json_error(['message' => 'Une autre opération WP WebP est déjà en cours.'], 409);
+        }
+    } elseif (!preg_match('/^[a-z0-9]{20}$/', $run_id)) {
+        wp_send_json_error(['message' => 'Session de nettoyage invalide.'], 400);
+    } elseif (!wp_webp_ensure_operation_lock($run_id)) {
+        wp_send_json_error(['message' => 'Une autre opération WP WebP est déjà en cours.'], 409);
+    }
+
+    try {
+        $ids = wp_webp_get_attachment_ids_after($after_id, 100);
+        $deleted = 0;
+        $failures = [];
+
+        foreach ($ids as $attachment_id) {
+            $deleted += wp_webp_delete_attachment_sizes($attachment_id, $disabled, $failures);
+        }
+
+        $next_after_id = $ids !== [] ? (int) end($ids) : $after_id;
+        $done = count($ids) < 100;
+        if ($done) {
+            wp_webp_release_operation_lock($run_id);
+        }
+
+        wp_send_json_success([
+            'run_id'  => $run_id,
+            'after_id' => $next_after_id,
+            'deleted'  => $deleted,
+            'done'     => $done,
+            'empty'    => false,
+            'failures' => $failures,
+            'sizes'    => $disabled,
+        ]);
+    } catch (Throwable $e) {
+        wp_webp_release_operation_lock($run_id);
+        error_log('[WP WebP] cleanup unused failed: ' . $e->getMessage());
+        wp_send_json_error(['message' => 'Nettoyage des formats impossible.'], 500);
+    }
 }
 
 function wp_webp_get_attachment_ids_after($after_id, $limit) {
@@ -930,34 +1240,60 @@ function wp_webp_get_attachment_ids_after($after_id, $limit) {
 }
 
 function wp_webp_delete_attachment_size($attachment_id, $size_name, &$failures = null) {
+    return wp_webp_delete_attachment_sizes($attachment_id, [(string) $size_name], $failures);
+}
+
+/**
+ * Supprime plusieurs formats d’un attachement en ne chargeant son fichier et
+ * ses métadonnées qu’une seule fois.
+ *
+ * @param string[] $size_names
+ */
+function wp_webp_delete_attachment_sizes($attachment_id, array $size_names, &$failures = null) {
     $original = get_attached_file($attachment_id);
-    $metadata = wp_get_attachment_metadata($attachment_id);
-    $size = is_array($metadata) && isset($metadata['sizes'][$size_name])
-        ? $metadata['sizes'][$size_name]
-        : null;
-
-    if (!$original || !is_array($size) || empty($size['file'])) {
+    if (!$original) {
         return 0;
     }
 
-    $file = basename((string) $size['file']);
-    $target = wp_webp_target_path(trailingslashit(dirname($original)) . $file);
+    $size_names = array_values(array_unique(array_filter(array_map('strval', $size_names))));
+    $metadata = in_array(WP_WEBP_ORIGINAL_SIZE, $size_names, true) && count($size_names) === 1
+        ? null
+        : wp_get_attachment_metadata($attachment_id);
+    $deleted = 0;
 
-    if ($target === '' || !file_exists($target)) {
-        return 0;
+    foreach ($size_names as $size_name) {
+        if ($size_name === WP_WEBP_ORIGINAL_SIZE) {
+            $target = wp_webp_target_path($original);
+        } else {
+            $size = is_array($metadata) && isset($metadata['sizes'][$size_name])
+                ? $metadata['sizes'][$size_name]
+                : null;
+
+            if (!is_array($size) || empty($size['file'])) {
+                continue;
+            }
+
+            $file = basename((string) $size['file']);
+            $target = wp_webp_target_path(trailingslashit(dirname($original)) . $file);
+        }
+
+        if ($target === '' || !file_exists($target)) {
+            continue;
+        }
+
+        if (!@unlink($target)) {
+            wp_webp_record_failure(
+                $failures,
+                wp_webp_relative_upload_path($target),
+                'Suppression du fichier WebP impossible'
+            );
+            continue;
+        }
+
+        $deleted++;
     }
 
-    if (!@unlink($target)) {
-        wp_webp_record_failure(
-            $failures,
-            wp_webp_relative_upload_path($target),
-            'Suppression du fichier WebP impossible'
-        );
-
-        return 0;
-    }
-
-    return 1;
+    return $deleted;
 }
 
 function wp_webp_admin_page() {
@@ -981,52 +1317,69 @@ function wp_webp_admin_page() {
         <?php endif; ?>
 
         <h2>Qualité des images</h2>
-        <fieldset id="wp-webp-profile">
-            <?php foreach (wp_webp_profiles() as $key => $profile) : ?>
-                <label style="display:block; margin-bottom:8px;">
-                    <input type="radio" name="<?php echo esc_attr(WP_WEBP_PROFILE_OPTION); ?>" value="<?php echo esc_attr($key); ?>" <?php checked($current, $key); ?>>
-                    <strong><?php echo esc_html($profile['label']); ?></strong>
-                    <?php echo esc_html($profile['desc']); ?>
-                </label>
-            <?php endforeach; ?>
-            <span id="wp-webp-profile-status" style="margin-left:4px; font-style:italic; color:#50575e;"></span>
-        </fieldset>
+        <?php $wp_webp_profiles = wp_webp_profiles(); ?>
+        <style>
+            #wp-webp-profile {
+                padding-right: 2em;
+                min-width: 10em;
+            }
+        </style>
+        <p style="margin-bottom:4px;">
+            <select id="wp-webp-profile" name="<?php echo esc_attr(WP_WEBP_PROFILE_OPTION); ?>">
+                <?php foreach ($wp_webp_profiles as $key => $profile) : ?>
+                    <option value="<?php echo esc_attr($key); ?>" <?php selected($current, $key); ?>>
+                        <?php echo esc_html($profile['label']); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </p>
+        <p id="wp-webp-profile-desc" style="margin-top:0; color:#50575e;">
+            <?php echo esc_html($wp_webp_profiles[$current]['desc'] ?? ''); ?>
+        </p>
         <script>
         (function () {
-            var fieldset = document.getElementById('wp-webp-profile');
-            var status = document.getElementById('wp-webp-profile-status');
-            if (!fieldset) { return; }
+            var select = document.getElementById('wp-webp-profile');
+            var desc = document.getElementById('wp-webp-profile-desc');
+            if (!select) { return; }
             var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
             var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_webp_profile_action')); ?>;
-            var radios = fieldset.querySelectorAll('input[type="radio"]');
+            var savedValue = select.value;
+            var descriptions = <?php
+                $descs = [];
+                foreach ($wp_webp_profiles as $key => $profile) {
+                    $descs[$key] = (string) ($profile['desc'] ?? '');
+                }
+                echo wp_json_encode($descs);
+            ?>;
 
-            radios.forEach(function (radio) {
-                radio.addEventListener('change', function () {
-                    if (!radio.checked) { return; }
-                    status.textContent = 'Enregistrement…';
+            select.addEventListener('change', function () {
+                if (desc) {
+                    desc.textContent = descriptions[select.value] || '';
+                }
 
-                    var body = new URLSearchParams();
-                    body.append('action', 'wp_webp_save_profile');
-                    body.append('nonce', nonce);
-                    body.append('profile', radio.value);
+                var body = new URLSearchParams();
+                body.append('action', 'wp_webp_save_profile');
+                body.append('nonce', nonce);
+                body.append('profile', select.value);
 
-                    fetch(ajaxUrl, {
-                        method: 'POST',
-                        credentials: 'same-origin',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: body.toString()
-                    })
-                    .then(function (r) { return r.json(); })
-                    .then(function (data) {
-                        if (data && data.success) {
-                            status.textContent = 'Enregistré.';
-                        } else {
-                            throw new Error('failed');
-                        }
-                    })
-                    .catch(function () {
-                        status.textContent = 'Erreur lors de l’enregistrement.';
-                    });
+                fetch(ajaxUrl, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (!data || !data.success) {
+                        throw new Error('failed');
+                    }
+                    savedValue = select.value;
+                })
+                .catch(function () {
+                    select.value = savedValue;
+                    if (desc) {
+                        desc.textContent = descriptions[savedValue] || '';
+                    }
                 });
             });
         })();
@@ -1060,13 +1413,27 @@ function wp_webp_admin_page() {
             var imagickOk = <?php echo $wp_webp_can_generate ? 'true' : 'false'; ?>;
             var MAX_ATTEMPTS = 3;
             var RETRY_DELAY = 2000;
+            var FAILURE_PREVIEW_LIMIT = 50;
+            var STORAGE_KEY = 'wp_webp_generate_run_' + <?php echo (int) get_current_user_id(); ?>;
 
             var state = {
                 running: false,
                 paused: false,
                 pausing: false,
                 cursor: null,
-                failures: []
+                failures: [],
+                failureCount: 0,
+                totalAttachments: 0
+            };
+
+            window.wpWebpSetOperationControls = function (locked) {
+                document.querySelectorAll(
+                    '#wp-webp-generate, #wp-webp-profile, .wp-webp-size-cb, #wp-webp-show-original, #wp-webp-clear, #wp-webp-cleanup-unused'
+                ).forEach(function (control) {
+                    control.disabled = control.id === 'wp-webp-generate'
+                        ? (!!locked || !imagickOk)
+                        : !!locked;
+                });
             };
 
             function setBar(processed, total) {
@@ -1075,18 +1442,58 @@ function wp_webp_admin_page() {
                 return pct;
             }
 
-            function renderFailures(failures) {
-                if (!failures.length) {
+            function renderFailures(failures, total) {
+                if (!total) {
                     return '';
                 }
                 var preview = failures.slice(0, 8).map(function (failure) {
                     return failure.file + (failure.error ? ' (' + failure.error + ')' : '');
                 }).join(' | ');
 
-                return ' — ' + failures.length + ' fichier(s) en erreur : ' + preview + (failures.length > 8 ? '…' : '');
+                return ' — ' + total + ' fichier(s) en erreur'
+                    + (preview ? ' : ' + preview + (total > 8 ? '…' : '') : '');
+            }
+
+            function persistState() {
+                if (!state.running || !state.cursor || !state.cursor.runId) {
+                    return;
+                }
+
+                try {
+                    sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
+                        cursor: state.cursor,
+                        failures: state.failures,
+                        failureCount: state.failureCount,
+                        totalAttachments: state.totalAttachments,
+                        paused: true
+                    }));
+                } catch (e) {}
+            }
+
+            function clearPersistedState() {
+                try {
+                    sessionStorage.removeItem(STORAGE_KEY);
+                } catch (e) {}
+            }
+
+            function loadPersistedState() {
+                try {
+                    var raw = sessionStorage.getItem(STORAGE_KEY);
+                    if (!raw) {
+                        return null;
+                    }
+                    var data = JSON.parse(raw);
+                    if (!data || !data.cursor || !data.cursor.runId) {
+                        return null;
+                    }
+                    return data;
+                } catch (e) {
+                    return null;
+                }
             }
 
             function syncGenerateButton() {
+                window.wpWebpSetOperationControls(state.running);
                 if (!state.running) {
                     btn.textContent = 'Générer les WebP';
                     btn.classList.add('button-primary');
@@ -1111,11 +1518,15 @@ function wp_webp_admin_page() {
                 btn.disabled = false;
             }
 
-            function stopGeneration() {
+            function stopGeneration(clearStorage) {
                 state.running = false;
                 state.paused = false;
                 state.pausing = false;
                 state.cursor = null;
+                state.totalAttachments = 0;
+                if (clearStorage !== false) {
+                    clearPersistedState();
+                }
                 syncGenerateButton();
             }
 
@@ -1153,7 +1564,9 @@ function wp_webp_admin_page() {
                             throw new Error(text ? text.slice(0, 300) : ('HTTP ' + r.status));
                         }
                         if (!r.ok && data && data.data && data.data.message) {
-                            throw new Error(data.data.message);
+                            var responseError = new Error(data.data.message);
+                            responseError.status = r.status;
+                            throw responseError;
                         }
                         return data;
                     });
@@ -1173,7 +1586,11 @@ function wp_webp_admin_page() {
                 return postBatch(cursor, '').catch(function (error) {
                     var message = (error && error.message) ? error.message : 'Erreur serveur';
 
-                    if (!state.running) {
+                    if (!state.running || state.paused) {
+                        throw error;
+                    }
+
+                    if (error && error.status && error.status < 500) {
                         throw error;
                     }
 
@@ -1196,27 +1613,52 @@ function wp_webp_admin_page() {
                 });
             }
 
-            function runBatch() {
-                if (!state.running || state.paused || !state.cursor) {
-                    return Promise.resolve();
+            function applyCursorFromResponse(data) {
+                state.cursor = {
+                    runId: data.data.run_id,
+                    attachmentId: data.data.attachment_id,
+                    jobIndex: data.data.job_index,
+                    processedJobs: data.data.processed_jobs,
+                    processedAttachments: data.data.processed_attachments,
+                    generated: data.data.generated
+                };
+                var incomingFailures = Array.isArray(data.data.failures) ? data.data.failures : [];
+                state.failures = state.failures.concat(incomingFailures).slice(0, FAILURE_PREVIEW_LIMIT);
+                if (Number.isFinite(Number(data.data.failure_count))) {
+                    state.failureCount = Math.max(0, Number(data.data.failure_count));
+                } else {
+                    state.failureCount += incomingFailures.length;
+                }
+                state.totalAttachments = data.data.total_attachments || state.totalAttachments;
+                persistState();
+                return setBar(data.data.processed_attachments, state.totalAttachments);
+            }
+
+            function markPaused(pct) {
+                state.pausing = false;
+                state.paused = true;
+                persistState();
+
+                var total = state.totalAttachments;
+                var processed = state.cursor ? state.cursor.processedAttachments : 0;
+                var generated = state.cursor ? state.cursor.generated : 0;
+                if (typeof pct !== 'number') {
+                    pct = total > 0 ? Math.round((processed / total) * 100) : 0;
                 }
 
-                return fetchBatch(state.cursor, 1)
-                .then(function (data) {
-                    state.cursor = {
-                        runId: data.data.run_id,
-                        attachmentId: data.data.attachment_id,
-                        jobIndex: data.data.job_index,
-                        processedJobs: data.data.processed_jobs,
-                        processedAttachments: data.data.processed_attachments,
-                        generated: data.data.generated
-                    };
-                    state.failures = state.failures.concat(data.data.failures || []);
+                status.textContent = 'En pause — '
+                    + pct + '% (' + processed + ' / ' + total
+                    + ' image(s), ' + generated + ' WebP généré(s)). Cliquez sur Reprendre.';
+                syncGenerateButton();
+            }
 
-                    var total = data.data.total_attachments;
-                    var pct = setBar(data.data.processed_attachments, total);
+            async function runBatch() {
+                while (state.running && !state.paused && state.cursor) {
+                    var data = await fetchBatch(state.cursor, 1);
+                    var pct = applyCursorFromResponse(data);
+
                     status.textContent = 'Traitement… ' + pct + '% ('
-                        + data.data.processed_attachments + ' / ' + total
+                        + data.data.processed_attachments + ' / ' + state.totalAttachments
                         + ' image(s), ' + data.data.processed_jobs + ' fichier(s), '
                         + data.data.generated + ' WebP généré(s)).';
 
@@ -1225,8 +1667,8 @@ function wp_webp_admin_page() {
                         status.textContent = 'Terminé : '
                             + data.data.processed_jobs + ' fichier(s) traité(s), '
                             + data.data.generated + ' WebP généré(s), '
-                            + state.failures.length + ' erreur(s).'
-                            + renderFailures(state.failures);
+                            + state.failureCount + ' erreur(s).'
+                            + renderFailures(state.failures, state.failureCount);
                         if (data.data.touched_sizes && data.data.generated_at_label) {
                             data.data.touched_sizes.forEach(function (sizeName) {
                                 var cell = document.querySelector('.wp-webp-generated-at[data-size="' + sizeName + '"]');
@@ -1235,22 +1677,22 @@ function wp_webp_admin_page() {
                                 }
                             });
                         }
+                        if (data.data.size_error_counts && window.wpWebpUpdateErrorCounts) {
+                            window.wpWebpUpdateErrorCounts(data.data.size_error_counts);
+                        }
                         stopGeneration();
                         return;
                     }
 
-                    if (state.paused || state.pausing) {
-                        state.pausing = false;
-                        state.paused = true;
-                        status.textContent = 'En pause — '
-                            + pct + '% (' + data.data.processed_attachments + ' / ' + total
-                            + ' image(s), ' + data.data.generated + ' WebP généré(s)). Cliquez sur Reprendre.';
-                        syncGenerateButton();
-                        return;
+                    if (data.data.size_error_counts && window.wpWebpUpdateErrorCounts) {
+                        window.wpWebpUpdateErrorCounts(data.data.size_error_counts);
                     }
 
-                    return runBatch();
-                });
+                    if (state.paused || state.pausing) {
+                        markPaused(pct);
+                        return;
+                    }
+                }
             }
 
             function startGeneration() {
@@ -1258,10 +1700,13 @@ function wp_webp_admin_page() {
                     return;
                 }
 
+                clearPersistedState();
                 state.running = true;
                 state.paused = false;
                 state.pausing = false;
                 state.failures = [];
+                state.failureCount = 0;
+                state.totalAttachments = 0;
                 state.cursor = {
                     runId: '',
                     attachmentId: 0,
@@ -1277,8 +1722,15 @@ function wp_webp_admin_page() {
                 syncGenerateButton();
 
                 runBatch().catch(function (err) {
+                    if (state.paused) {
+                        return;
+                    }
                     status.textContent = 'Erreur : ' + (err && err.message ? err.message : 'lors de la génération.');
-                    stopGeneration();
+                    if (state.cursor && state.cursor.runId) {
+                        markPaused();
+                    } else {
+                        stopGeneration();
+                    }
                 });
             }
 
@@ -1289,12 +1741,20 @@ function wp_webp_admin_page() {
 
                 state.paused = false;
                 state.pausing = false;
+                persistState();
                 status.textContent = 'Reprise…';
                 syncGenerateButton();
 
                 runBatch().catch(function (err) {
+                    if (state.paused) {
+                        return;
+                    }
                     status.textContent = 'Erreur : ' + (err && err.message ? err.message : 'lors de la génération.');
-                    stopGeneration();
+                    if (state.cursor && state.cursor.runId) {
+                        markPaused();
+                    } else {
+                        stopGeneration();
+                    }
                 });
             }
 
@@ -1305,6 +1765,28 @@ function wp_webp_admin_page() {
 
                 state.pausing = true;
                 syncGenerateButton();
+            }
+
+            function restorePausedSession() {
+                var saved = loadPersistedState();
+                if (!saved || !imagickOk) {
+                    return;
+                }
+
+                state.running = true;
+                state.paused = true;
+                state.pausing = false;
+                state.cursor = saved.cursor;
+                state.failures = Array.isArray(saved.failures) ? saved.failures : [];
+                state.failureCount = Math.max(0, Number(saved.failureCount) || state.failures.length);
+                state.totalAttachments = saved.totalAttachments || 0;
+
+                progress.style.display = '';
+                setBar(
+                    state.cursor.processedAttachments || 0,
+                    state.totalAttachments || 0
+                );
+                markPaused();
             }
 
             btn.addEventListener('click', function () {
@@ -1320,6 +1802,61 @@ function wp_webp_admin_page() {
 
                 requestPause();
             });
+
+            window.addEventListener('beforeunload', function (event) {
+                if (!state.running) {
+                    return;
+                }
+                event.preventDefault();
+                event.returnValue = '';
+            });
+
+            // Confirmation « Quitter » : coupe la génération (pas de reprise au retour).
+            window.addEventListener('pagehide', function () {
+                if (!state.running) {
+                    return;
+                }
+
+                var runId = state.cursor && state.cursor.runId ? state.cursor.runId : '';
+                clearPersistedState();
+                state.running = false;
+                state.paused = false;
+                state.pausing = false;
+                state.cursor = null;
+
+                if (!runId) {
+                    return;
+                }
+
+                var body = new URLSearchParams();
+                body.append('action', 'wp_webp_abort_generate');
+                body.append('nonce', nonce);
+                body.append('run_id', runId);
+
+                var payload = new Blob([body.toString()], {
+                    type: 'application/x-www-form-urlencoded;charset=UTF-8'
+                });
+
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon(ajaxUrl, payload);
+                    return;
+                }
+
+                try {
+                    fetch(ajaxUrl, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        keepalive: true,
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString()
+                    });
+                } catch (e) {}
+            });
+
+            restorePausedSession();
+            document.addEventListener('DOMContentLoaded', function () {
+                window.wpWebpSetOperationControls(state.running);
+            });
         })();
         </script>
 
@@ -1327,7 +1864,7 @@ function wp_webp_admin_page() {
 
         <h2>Liste des formats</h2>
         <?php $wp_webp_sizes = wp_webp_get_image_sizes(); ?>
-        <table class="wp-list-table widefat fixed striped" style="max-width:900px;">
+        <table class="wp-list-table widefat fixed striped" style="max-width:1040px;">
             <thead>
                 <tr>
                     <th scope="col" class="wp-webp-col-name">Nom</th>
@@ -1336,9 +1873,46 @@ function wp_webp_admin_page() {
                     <th scope="col">Crop</th>
                     <th scope="col">Compresser</th>
                     <th scope="col" class="wp-webp-col-generated">Dernière génération</th>
+                    <th scope="col" class="wp-webp-col-errors">Erreurs</th>
                 </tr>
             </thead>
             <tbody id="wp-webp-sizes">
+                <?php
+                $wp_webp_render_error_cell = static function ($size_name) {
+                    $count = wp_webp_get_size_error_count($size_name);
+                    ?>
+                    <td class="wp-webp-keep wp-webp-errors-cell" data-size="<?php echo esc_attr($size_name); ?>">
+                        <?php if ($count <= 0) : ?>
+                            <span class="wp-webp-no-errors">—</span>
+                        <?php else : ?>
+                            <span class="wp-webp-error-count"><?php echo (int) $count; ?></span>
+                            <button
+                                type="button"
+                                class="button-link wp-webp-view-errors"
+                                data-size="<?php echo esc_attr($size_name); ?>"
+                            >Afficher</button>
+                        <?php endif; ?>
+                    </td>
+                    <?php
+                };
+                ?>
+                <?php
+                $original_enabled = wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE);
+                $original_visible = wp_webp_show_original_size();
+                ?>
+                <tr id="wp-webp-original-row" class="wp-webp-size-row<?php echo $original_enabled ? '' : ' wp-webp-dim'; ?>"<?php echo $original_visible ? '' : ' hidden'; ?>>
+                    <td class="wp-webp-col-name"><strong><?php echo esc_html(WP_WEBP_ORIGINAL_SIZE); ?></strong></td>
+                    <td>—</td>
+                    <td>—</td>
+                    <td>—</td>
+                    <td class="wp-webp-keep">
+                        <input type="checkbox" class="wp-webp-size-cb" data-size="<?php echo esc_attr(WP_WEBP_ORIGINAL_SIZE); ?>" <?php checked($original_enabled); ?>>
+                    </td>
+                    <td class="wp-webp-col-generated wp-webp-generated-at" data-size="<?php echo esc_attr(WP_WEBP_ORIGINAL_SIZE); ?>">
+                        <?php echo esc_html(wp_webp_format_generated_at(wp_webp_get_size_generated_at(WP_WEBP_ORIGINAL_SIZE))); ?>
+                    </td>
+                    <?php $wp_webp_render_error_cell(WP_WEBP_ORIGINAL_SIZE); ?>
+                </tr>
                 <?php foreach ($wp_webp_sizes as $name => $size) : ?>
                     <?php $size_enabled = wp_webp_size_enabled($name); ?>
                     <tr class="wp-webp-size-row<?php echo $size_enabled ? '' : ' wp-webp-dim'; ?>">
@@ -1352,20 +1926,80 @@ function wp_webp_admin_page() {
                         <td class="wp-webp-col-generated wp-webp-generated-at" data-size="<?php echo esc_attr($name); ?>">
                             <?php echo esc_html(wp_webp_format_generated_at(wp_webp_get_size_generated_at($name))); ?>
                         </td>
+                        <?php $wp_webp_render_error_cell($name); ?>
                     </tr>
                 <?php endforeach; ?>
             </tbody>
         </table>
         <style>
             tr.wp-webp-dim td:not(.wp-webp-keep) { opacity: .45; }
-            .wp-list-table .wp-webp-col-name { width: 22%; }
-            .wp-list-table .wp-webp-col-generated { width: 28%; white-space: nowrap; }
+            .wp-list-table .wp-webp-col-name { width: 20%; }
+            .wp-list-table .wp-webp-col-generated { width: 22%; white-space: nowrap; }
+            .wp-list-table .wp-webp-col-errors { width: 12%; white-space: nowrap; }
+            .wp-webp-errors-cell .wp-webp-error-count { display: inline-block; min-width: 1.5em; margin-right: 6px; }
+            .wp-webp-view-errors {
+                color: #2271b1 !important;
+                text-decoration: underline !important;
+            }
+            .wp-webp-view-errors:not(:disabled):hover,
+            .wp-webp-view-errors:not(:disabled):focus { color: #135e96 !important; }
+            #wp-webp-errors-modal[hidden] { display: none !important; }
+            #wp-webp-errors-modal {
+                position: fixed; inset: 0; z-index: 100000;
+                display: flex; align-items: center; justify-content: center;
+            }
+            #wp-webp-errors-modal .wp-webp-modal-backdrop {
+                position: absolute; inset: 0; background: rgba(0,0,0,.55);
+            }
+            #wp-webp-errors-modal .wp-webp-modal-dialog {
+                position: relative; z-index: 1;
+                background: #fff; border-radius: 4px;
+                width: min(720px, calc(100vw - 32px));
+                max-height: min(80vh, 640px);
+                display: flex; flex-direction: column;
+                box-shadow: 0 8px 30px rgba(0,0,0,.25);
+            }
+            #wp-webp-errors-modal .wp-webp-modal-header {
+                display: flex; align-items: center; justify-content: space-between;
+                gap: 12px; padding: 12px 16px; border-bottom: 1px solid #dcdcde;
+            }
+            #wp-webp-errors-modal .wp-webp-modal-header h3 { margin: 0; font-size: 15px; }
+            #wp-webp-errors-modal .wp-webp-modal-body {
+                padding: 12px 16px; overflow: auto; flex: 1;
+            }
+            #wp-webp-errors-modal .wp-webp-modal-list {
+                margin: 0; padding-left: 18px;
+            }
+            #wp-webp-errors-modal .wp-webp-modal-list li {
+                margin: 0 0 8px; word-break: break-word;
+            }
+            #wp-webp-errors-modal .wp-webp-modal-list code {
+                font-size: 12px;
+            }
         </style>
+        <div id="wp-webp-errors-modal" hidden>
+            <div class="wp-webp-modal-backdrop" data-close="1"></div>
+            <div class="wp-webp-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="wp-webp-errors-modal-title">
+                <div class="wp-webp-modal-header">
+                    <h3 id="wp-webp-errors-modal-title">Erreurs</h3>
+                    <button type="button" class="button" id="wp-webp-errors-modal-close">Fermer</button>
+                </div>
+                <div class="wp-webp-modal-body">
+                    <p id="wp-webp-errors-modal-status" style="margin-top:0; font-style:italic; color:#50575e;"></p>
+                    <ol class="wp-webp-modal-list" id="wp-webp-errors-modal-list"></ol>
+                </div>
+            </div>
+        </div>
         <p><span id="wp-webp-sizes-status" style="font-style:italic; color:#50575e;"></span></p>
         <script>
         (function () {
             var tbody = document.getElementById('wp-webp-sizes');
             var status = document.getElementById('wp-webp-sizes-status');
+            var modal = document.getElementById('wp-webp-errors-modal');
+            var modalTitle = document.getElementById('wp-webp-errors-modal-title');
+            var modalStatus = document.getElementById('wp-webp-errors-modal-status');
+            var modalList = document.getElementById('wp-webp-errors-modal-list');
+            var modalClose = document.getElementById('wp-webp-errors-modal-close');
             if (!tbody) { return; }
             var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
             var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_webp_size_action')); ?>;
@@ -1376,14 +2010,63 @@ function wp_webp_admin_page() {
                 row.classList.toggle('wp-webp-dim', !cb.checked);
             }
 
-            function cleanupSize(size, afterId, deleted, failures) {
-                var body = new URLSearchParams();
-                body.append('action', 'wp_webp_cleanup_size');
-                body.append('nonce', nonce);
-                body.append('size', size);
-                body.append('after_id', String(afterId));
+            window.wpWebpUpdateErrorCounts = function (counts) {
+                if (!counts || typeof counts !== 'object') {
+                    return;
+                }
+                Object.keys(counts).forEach(function (sizeName) {
+                    var cell = tbody.querySelector('.wp-webp-errors-cell[data-size="' + sizeName + '"]');
+                    if (!cell) {
+                        return;
+                    }
+                    var count = parseInt(counts[sizeName], 10) || 0;
+                    cell.replaceChildren();
+                    if (count <= 0) {
+                        var empty = document.createElement('span');
+                        empty.className = 'wp-webp-no-errors';
+                        empty.textContent = '—';
+                        cell.appendChild(empty);
+                        return;
+                    }
 
-                return fetch(ajaxUrl, {
+                    var label = document.createElement('span');
+                    label.className = 'wp-webp-error-count';
+                    label.textContent = String(count);
+
+                    var btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'button-link wp-webp-view-errors';
+                    btn.dataset.size = sizeName;
+                    btn.textContent = 'Afficher';
+
+                    cell.append(label, btn);
+                });
+            };
+
+            function closeModal() {
+                if (!modal) {
+                    return;
+                }
+                modal.hidden = true;
+                document.body.style.overflow = '';
+            }
+
+            function openModal(sizeName) {
+                if (!modal) {
+                    return;
+                }
+                modalTitle.textContent = 'Erreurs — ' + sizeName;
+                modalStatus.textContent = 'Chargement…';
+                modalList.innerHTML = '';
+                modal.hidden = false;
+                document.body.style.overflow = 'hidden';
+
+                var body = new URLSearchParams();
+                body.append('action', 'wp_webp_get_size_errors');
+                body.append('nonce', nonce);
+                body.append('size', sizeName);
+
+                fetch(ajaxUrl, {
                     method: 'POST',
                     credentials: 'same-origin',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1394,22 +2077,48 @@ function wp_webp_admin_page() {
                     if (!data || !data.success) {
                         throw new Error('failed');
                     }
-
-                    deleted += data.data.deleted || 0;
-                    failures += (data.data.failures || []).length;
-                    status.textContent = 'Nettoyage des anciens WebP… ' + deleted + ' supprimé(s).';
-
-                    if (!data.data.done) {
-                        return cleanupSize(size, data.data.after_id, deleted, failures);
-                    }
-
-                    status.textContent = 'Enregistré : ' + deleted + ' ancien(s) WebP supprimé(s)'
-                        + (failures ? ', ' + failures + ' erreur(s).' : '.');
+                    var errors = data.data.errors || [];
+                    modalStatus.textContent = errors.length
+                        ? (errors.length + ' erreur(s)')
+                        : 'Aucune erreur enregistrée.';
+                    modalList.innerHTML = '';
+                    errors.forEach(function (item) {
+                        var li = document.createElement('li');
+                        var code = document.createElement('code');
+                        code.textContent = item.file || 'fichier inconnu';
+                        li.appendChild(code);
+                        li.appendChild(document.createTextNode(' — ' + (item.error || 'Conversion impossible')));
+                        modalList.appendChild(li);
+                    });
                 })
                 .catch(function () {
-                    status.textContent = 'Format désactivé, mais nettoyage incomplet. Relancez sa désactivation.';
+                    modalStatus.textContent = 'Impossible de charger les erreurs.';
                 });
             }
+
+            tbody.addEventListener('click', function (event) {
+                var btn = event.target.closest('.wp-webp-view-errors');
+                if (!btn || btn.disabled) {
+                    return;
+                }
+                openModal(btn.getAttribute('data-size') || '');
+            });
+
+            if (modalClose) {
+                modalClose.addEventListener('click', closeModal);
+            }
+            if (modal) {
+                modal.addEventListener('click', function (event) {
+                    if (event.target && event.target.getAttribute('data-close') === '1') {
+                        closeModal();
+                    }
+                });
+            }
+            document.addEventListener('keydown', function (event) {
+                if (event.key === 'Escape' && modal && !modal.hidden) {
+                    closeModal();
+                }
+            });
 
             tbody.querySelectorAll('.wp-webp-size-cb').forEach(function (cb) {
                 cb.addEventListener('change', function () {
@@ -1433,9 +2142,6 @@ function wp_webp_admin_page() {
                     .then(function (data) {
                         if (data && data.success) {
                             status.textContent = 'Enregistré.';
-                            if (data.data.cleanup_required) {
-                                return cleanupSize(data.data.size, 0, 0, 0);
-                            }
                         } else {
                             throw new Error('failed');
                         }
@@ -1456,10 +2162,79 @@ function wp_webp_admin_page() {
         <hr>
 
         <h2>Developer</h2>
+        <p>
+            <label>
+                <input type="checkbox" id="wp-webp-show-original" <?php checked(wp_webp_show_original_size()); ?>>
+                Afficher le format original dans la liste des formats
+            </label>
+            <span id="wp-webp-show-original-status" style="margin-left:8px; font-style:italic; color:#50575e;"></span>
+        </p>
        <p>
             <button type="button" class="button button-secondary" id="wp-webp-clear">Effacer tous les WebP des uploads</button>
             <span id="wp-webp-clear-status" style="margin-left:8px; font-style:italic; color:#50575e;"></span>
         </p>
+       <p>
+            <button type="button" class="button button-secondary" id="wp-webp-cleanup-unused">Effacer les WebP des formats non utilisés</button>
+            <span id="wp-webp-cleanup-unused-status" style="margin-left:8px; font-style:italic; color:#50575e;"></span>
+        </p>
+        <script>
+        (function () {
+            var checkbox = document.getElementById('wp-webp-show-original');
+            var row = document.getElementById('wp-webp-original-row');
+            var status = document.getElementById('wp-webp-show-original-status');
+            if (!checkbox || !row) { return; }
+
+            var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+            var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_webp_original_visibility_action')); ?>;
+            var savedVisible = checkbox.checked;
+
+            checkbox.addEventListener('change', function () {
+                var requestedVisible = checkbox.checked;
+                var originalCheckbox = row.querySelector('.wp-webp-size-cb');
+                var originalEnabled = originalCheckbox ? originalCheckbox.checked : true;
+                checkbox.disabled = true;
+                row.hidden = !requestedVisible;
+                status.textContent = 'Enregistrement…';
+
+                if (!requestedVisible && originalCheckbox) {
+                    originalCheckbox.checked = true;
+                    row.classList.remove('wp-webp-dim');
+                }
+
+                var body = new URLSearchParams();
+                body.append('action', 'wp_webp_save_original_visibility');
+                body.append('nonce', nonce);
+                body.append('visible', requestedVisible ? '1' : '0');
+
+                fetch(ajaxUrl, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (!data || !data.success) {
+                        throw new Error('failed');
+                    }
+                    savedVisible = requestedVisible;
+                    status.textContent = 'Enregistré.';
+                })
+                .catch(function () {
+                    checkbox.checked = savedVisible;
+                    row.hidden = !savedVisible;
+                    if (originalCheckbox) {
+                        originalCheckbox.checked = originalEnabled;
+                        row.classList.toggle('wp-webp-dim', !originalEnabled);
+                    }
+                    status.textContent = 'Erreur lors de l’enregistrement.';
+                })
+                .finally(function () {
+                    checkbox.disabled = false;
+                });
+            });
+        })();
+        </script>
         <script>
         (function () {
             var btn = document.getElementById('wp-webp-clear');
@@ -1468,20 +2243,21 @@ function wp_webp_admin_page() {
             var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
             var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_webp_clear_action')); ?>;
 
-            function clearBatch(runId, deleted, failures) {
-                var body = new URLSearchParams();
-                body.append('action', 'wp_webp_clear_webp');
-                body.append('nonce', nonce);
-                body.append('run_id', runId);
+            async function clearBatch(runId, deleted, failures) {
+                try {
+                    while (true) {
+                        var body = new URLSearchParams();
+                        body.append('action', 'wp_webp_clear_webp');
+                        body.append('nonce', nonce);
+                        body.append('run_id', runId);
 
-                return fetch(ajaxUrl, {
-                    method: 'POST',
-                    credentials: 'same-origin',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: body.toString()
-                })
-                .then(function (r) { return r.json(); })
-                .then(function (data) {
+                        var response = await fetch(ajaxUrl, {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: body.toString()
+                        });
+                        var data = await response.json();
                     if (!data || !data.success) {
                         throw new Error('failed');
                     }
@@ -1491,16 +2267,15 @@ function wp_webp_admin_page() {
                     failures += (data.data.failures || []).length;
                     status.textContent = 'Suppression… ' + deleted + ' fichier(s) WebP supprimé(s).';
 
-                    if (!data.data.done) {
-                        return clearBatch(runId, deleted, failures);
+                        if (data.data.done) {
+                            status.textContent = deleted + ' fichier(s) WebP supprimé(s)'
+                                + (failures ? ', ' + failures + ' erreur(s).' : '.');
+                            return;
+                        }
                     }
-
-                    status.textContent = deleted + ' fichier(s) WebP supprimé(s)'
-                        + (failures ? ', ' + failures + ' erreur(s).' : '.');
-                })
-                .catch(function () {
+                } catch (error) {
                     status.textContent = 'Erreur lors de la suppression.';
-                });
+                }
             }
 
             btn.addEventListener('click', function () {
@@ -1508,10 +2283,90 @@ function wp_webp_admin_page() {
                     return;
                 }
                 btn.disabled = true;
+                if (window.wpWebpSetOperationControls) {
+                    window.wpWebpSetOperationControls(true);
+                }
                 status.textContent = 'Initialisation…';
 
                 clearBatch('', 0, 0).finally(function () {
-                    btn.disabled = false;
+                    if (window.wpWebpSetOperationControls) {
+                        window.wpWebpSetOperationControls(false);
+                    } else {
+                        btn.disabled = false;
+                    }
+                });
+            });
+        })();
+        </script>
+        <script>
+        (function () {
+            var btn = document.getElementById('wp-webp-cleanup-unused');
+            var status = document.getElementById('wp-webp-cleanup-unused-status');
+            if (!btn) { return; }
+            var ajaxUrl = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+            var nonce = <?php echo wp_json_encode(wp_create_nonce('wp_webp_clear_action')); ?>;
+
+            async function cleanupBatch(afterId, deleted, failures) {
+                var runId = '';
+                try {
+                    while (true) {
+                        var body = new URLSearchParams();
+                        body.append('action', 'wp_webp_cleanup_unused');
+                        body.append('nonce', nonce);
+                        body.append('after_id', String(afterId));
+                        body.append('run_id', runId);
+
+                        var response = await fetch(ajaxUrl, {
+                            method: 'POST',
+                            credentials: 'same-origin',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: body.toString()
+                        });
+                        var data = await response.json();
+                    if (!data || !data.success) {
+                        throw new Error('failed');
+                    }
+
+                    runId = data.data.run_id || runId;
+
+                    if (data.data.empty) {
+                        status.textContent = 'Aucun format désactivé : rien à supprimer.';
+                        return;
+                    }
+
+                    deleted += data.data.deleted || 0;
+                    failures += (data.data.failures || []).length;
+                    status.textContent = 'Nettoyage… ' + deleted + ' fichier(s) WebP supprimé(s).';
+
+                        if (data.data.done) {
+                            status.textContent = deleted + ' fichier(s) WebP des formats non utilisés supprimé(s)'
+                                + (failures ? ', ' + failures + ' erreur(s).' : '.');
+                            return;
+                        }
+
+                        afterId = data.data.after_id;
+                    }
+                } catch (error) {
+                    status.textContent = 'Erreur lors du nettoyage des formats non utilisés.';
+                }
+            }
+
+            btn.addEventListener('click', function () {
+                if (!window.confirm('Supprimer les WebP des formats dont Compresser est décoché ?')) {
+                    return;
+                }
+                btn.disabled = true;
+                if (window.wpWebpSetOperationControls) {
+                    window.wpWebpSetOperationControls(true);
+                }
+                status.textContent = 'Initialisation…';
+
+                cleanupBatch(0, 0, 0).finally(function () {
+                    if (window.wpWebpSetOperationControls) {
+                        window.wpWebpSetOperationControls(false);
+                    } else {
+                        btn.disabled = false;
+                    }
                 });
             });
         })();
@@ -1525,9 +2380,144 @@ function wp_webp_admin_page() {
  * ---------------------------------------------------------------------- */
 
 add_action('wp_ajax_wp_webp_generate_webp', 'wp_webp_ajax_generate_webp');
+add_action('wp_ajax_wp_webp_abort_generate', 'wp_webp_ajax_abort_generate');
+add_action('wp_ajax_wp_webp_get_size_errors', 'wp_webp_ajax_get_size_errors');
+
+function wp_webp_ajax_get_size_errors() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_webp_size_action', 'nonce');
+
+    $size = isset($_POST['size']) ? sanitize_key(wp_unslash($_POST['size'])) : '';
+    $valid = array_merge([WP_WEBP_ORIGINAL_SIZE], array_keys(wp_webp_get_image_sizes()));
+    if ($size === '' || !in_array($size, $valid, true)) {
+        wp_send_json_error(['message' => 'Format inconnu.'], 400);
+    }
+
+    $errors = wp_webp_get_size_errors($size);
+    wp_send_json_success([
+        'size'   => $size,
+        'count'  => count($errors),
+        'errors' => $errors,
+    ]);
+}
+
+function wp_webp_ajax_abort_generate() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Permissions insuffisantes.'], 403);
+    }
+
+    check_ajax_referer('wp_webp_generate_action', 'nonce');
+
+    $run_id = isset($_POST['run_id'])
+        ? strtolower(preg_replace('/[^a-z0-9]/i', '', (string) wp_unslash($_POST['run_id'])))
+        : '';
+
+    if ($run_id === '' || !preg_match('/^[a-z0-9]{20}$/', $run_id)) {
+        wp_send_json_error(['message' => 'Run invalide.'], 400);
+    }
+
+    delete_transient(wp_webp_generation_run_key($run_id));
+    wp_webp_release_operation_lock($run_id);
+    wp_send_json_success(['aborted' => true]);
+}
 
 function wp_webp_generation_run_key($run_id) {
     return 'wp_webp_run_' . get_current_user_id() . '_' . md5((string) $run_id);
+}
+
+/**
+ * Verrou global des générations manuelles afin de ne pas saturer PHP-FPM et
+ * de ne pas faire concourir les écritures de journaux et de fichiers.
+ *
+ * @return array{run_id:string,user_id:int,expires:int}|null
+ */
+function wp_webp_operation_lock_option_name() {
+    $name = sanitize_key((string) apply_filters(
+        'wp_webp_operation_lock_option_name',
+        WP_WEBP_OPERATION_LOCK_OPTION
+    ));
+
+    return $name !== '' ? $name : WP_WEBP_OPERATION_LOCK_OPTION;
+}
+
+function wp_webp_get_operation_lock() {
+    $lock = get_option(wp_webp_operation_lock_option_name(), null);
+    if (!is_array($lock) || empty($lock['run_id'])) {
+        return null;
+    }
+
+    return [
+        'run_id' => (string) $lock['run_id'],
+        'user_id' => (int) ($lock['user_id'] ?? 0),
+        'expires' => (int) ($lock['expires'] ?? 0),
+    ];
+}
+
+function wp_webp_operation_is_locked() {
+    $lock = wp_webp_get_operation_lock();
+    if ($lock === null) {
+        return false;
+    }
+    if ($lock['expires'] > time()) {
+        return true;
+    }
+
+    delete_option(wp_webp_operation_lock_option_name());
+    return false;
+}
+
+function wp_webp_acquire_operation_lock($run_id) {
+    $run_id = (string) $run_id;
+    if (!preg_match('/^[a-z0-9]{20}$/', $run_id)) {
+        return false;
+    }
+
+    $now = time();
+    $lock = wp_webp_get_operation_lock();
+    if ($lock !== null && $lock['run_id'] === $run_id) {
+        return wp_webp_refresh_operation_lock($run_id);
+    }
+    if ($lock !== null && $lock['expires'] > $now) {
+        return false;
+    }
+    if ($lock !== null) {
+        delete_option(wp_webp_operation_lock_option_name());
+    }
+
+    return add_option(wp_webp_operation_lock_option_name(), [
+        'run_id' => $run_id,
+        'user_id' => get_current_user_id(),
+        'expires' => $now + WP_WEBP_OPERATION_LOCK_TTL,
+    ], '', false);
+}
+
+function wp_webp_refresh_operation_lock($run_id) {
+    $lock = wp_webp_get_operation_lock();
+    if ($lock === null || $lock['run_id'] !== (string) $run_id) {
+        return false;
+    }
+
+    $lock['expires'] = time() + WP_WEBP_OPERATION_LOCK_TTL;
+    update_option(wp_webp_operation_lock_option_name(), $lock, false);
+
+    return true;
+}
+
+function wp_webp_ensure_operation_lock($run_id) {
+    return wp_webp_refresh_operation_lock($run_id)
+        || wp_webp_acquire_operation_lock($run_id);
+}
+
+function wp_webp_release_operation_lock($run_id) {
+    $lock = wp_webp_get_operation_lock();
+    if ($lock === null || $lock['run_id'] !== (string) $run_id) {
+        return false;
+    }
+
+    return delete_option(wp_webp_operation_lock_option_name());
 }
 
 function wp_webp_create_generation_run($only_size = '') {
@@ -1549,7 +2539,18 @@ function wp_webp_create_generation_run($only_size = '') {
         'failure_count'     => 0,
     ];
 
-    set_transient(wp_webp_generation_run_key($run_id), $state, HOUR_IN_SECONDS);
+    if (!wp_webp_acquire_operation_lock($run_id)) {
+        throw new RuntimeException('Une opération WP WebP est déjà en cours.', 409);
+    }
+
+    try {
+        set_transient(wp_webp_generation_run_key($run_id), $state, HOUR_IN_SECONDS);
+        wp_webp_clear_size_errors(wp_webp_sizes_for_generation_scope($only_size));
+    } catch (Throwable $e) {
+        delete_transient(wp_webp_generation_run_key($run_id));
+        wp_webp_release_operation_lock($run_id);
+        throw $e;
+    }
 
     return [$run_id, $state];
 }
@@ -1615,6 +2616,7 @@ function wp_webp_ajax_generate_webp() {
 
             if ($attachment_id === 0) {
                 delete_transient(wp_webp_generation_run_key($run_id));
+                wp_webp_release_operation_lock($run_id);
                 $touched = wp_webp_generation_completion(
                     $run_state['only_size'] ?? '',
                     $run_state['failure_count'] ?? 0
@@ -1633,12 +2635,17 @@ function wp_webp_ajax_generate_webp() {
                     'touched_sizes'  => $touched['sizes'],
                     'generated_at'   => $touched['timestamp'],
                     'generated_at_label' => $touched['label'],
+                    'size_error_counts' => wp_webp_get_size_error_counts(),
                 ]);
             }
         } else {
             $run_state = wp_webp_get_generation_run($run_id);
             if ($run_state === null) {
+                wp_webp_release_operation_lock($run_id);
                 wp_send_json_error(['message' => 'Session de génération expirée. Relancez la génération.'], 410);
+            }
+            if (!wp_webp_ensure_operation_lock($run_id)) {
+                wp_send_json_error(['message' => 'Une autre opération WP WebP est déjà en cours.'], 409);
             }
             set_transient(wp_webp_generation_run_key($run_id), $run_state, HOUR_IN_SECONDS);
         }
@@ -1661,6 +2668,7 @@ function wp_webp_ajax_generate_webp() {
 
         if (!empty($seek['done'])) {
             delete_transient(wp_webp_generation_run_key($run_id));
+            wp_webp_release_operation_lock($run_id);
             $touched = wp_webp_generation_completion(
                 $only_size,
                 $run_state['failure_count'] ?? 0
@@ -1679,6 +2687,7 @@ function wp_webp_ajax_generate_webp() {
                 'touched_sizes'         => $touched['sizes'],
                 'generated_at'          => $touched['timestamp'],
                 'generated_at_label'    => $touched['label'],
+                'size_error_counts'     => wp_webp_get_size_error_counts(),
             ]);
         }
 
@@ -1698,6 +2707,7 @@ function wp_webp_ajax_generate_webp() {
                 'only_size'             => $only_size,
                 'done'                  => false,
                 'failures'              => [],
+                'size_error_counts'     => wp_webp_get_size_error_counts(),
             ]);
         }
 
@@ -1706,7 +2716,16 @@ function wp_webp_ajax_generate_webp() {
         if ($skip_attachment) {
             $skip_message = 'Ignoré après un échec serveur'
                 . ($skip_reason !== '' ? ' : ' . $skip_reason : '');
-            wp_webp_record_failure($failures, 'attachment #' . (int) $attachment_id, $skip_message);
+            $skip_jobs = wp_webp_jobs_for_attachment($attachment_id, $only_size);
+            $skip_size = isset($skip_jobs[$job_index])
+                ? wp_webp_job_size($skip_jobs[$job_index], $only_size)
+                : ($only_size !== '' ? $only_size : WP_WEBP_ORIGINAL_SIZE);
+            wp_webp_record_failure(
+                $failures,
+                'attachment #' . (int) $attachment_id,
+                $skip_message,
+                $skip_size
+            );
             error_log('[WP WebP] attachment #' . (int) $attachment_id . ' skipped — ' . $skip_message);
 
             $next_attachment = wp_webp_get_next_attachment_id($attachment_id, $max_attachment_id);
@@ -1753,9 +2772,14 @@ function wp_webp_ajax_generate_webp() {
                     $processed_jobs++;
                 }
             } catch (Throwable $e) {
+                $failed_jobs = wp_webp_jobs_for_attachment($attachment_id, $only_size);
+                $failed_size = isset($failed_jobs[$job_index])
+                    ? wp_webp_job_size($failed_jobs[$job_index], $only_size)
+                    : ($only_size !== '' ? $only_size : WP_WEBP_ORIGINAL_SIZE);
                 $failures[] = [
                     'file'  => 'attachment #' . (int) $attachment_id,
                     'error' => $e->getMessage(),
+                    'size'  => $failed_size,
                 ];
                 error_log('[WP WebP] attachment #' . (int) $attachment_id . ': ' . $e->getMessage());
 
@@ -1778,6 +2802,10 @@ function wp_webp_ajax_generate_webp() {
             }
         }
 
+        if ($failures !== []) {
+            wp_webp_append_size_errors($failures);
+        }
+
         $run_state['failure_count'] = (int) ($run_state['failure_count'] ?? 0) + count($failures);
 
         // Un attachement peut occuper plusieurs lots : il n'est compté comme
@@ -1788,6 +2816,7 @@ function wp_webp_ajax_generate_webp() {
 
         if ($cursor['done']) {
             delete_transient(wp_webp_generation_run_key($run_id));
+            wp_webp_release_operation_lock($run_id);
             $touched = wp_webp_generation_completion($only_size, $run_state['failure_count']);
         } else {
             set_transient(wp_webp_generation_run_key($run_id), $run_state, HOUR_IN_SECONDS);
@@ -1813,13 +2842,16 @@ function wp_webp_ajax_generate_webp() {
             'touched_sizes'  => $touched['sizes'],
             'generated_at'   => $touched['timestamp'],
             'generated_at_label' => $touched['label'],
+            'size_error_counts' => wp_webp_get_size_error_counts(),
         ]);
     } catch (Throwable $e) {
         if ($run_id !== '') {
             delete_transient(wp_webp_generation_run_key($run_id));
+            wp_webp_release_operation_lock($run_id);
         }
         error_log('[WP WebP] generate batch failed: ' . $e->getMessage());
-        wp_send_json_error(['message' => $e->getMessage()], 500);
+        $status = (int) $e->getCode() === 409 ? 409 : 500;
+        wp_send_json_error(['message' => $e->getMessage()], $status);
     }
 }
 
@@ -1870,32 +2902,49 @@ function wp_webp_ajax_clear_webp() {
             'protected' => wp_webp_get_native_webp_keys(),
             'directories' => [$basedir],
             'current_directory' => '',
+            'current_entries' => null,
+            'current_index' => 0,
             'after_name' => '',
         ];
+        if (!wp_webp_acquire_operation_lock($run_id)) {
+            wp_send_json_error(['message' => 'Une autre opération WP WebP est déjà en cours.'], 409);
+        }
     } elseif (!preg_match('/^[a-z0-9]{20}$/', $run_id)) {
         wp_send_json_error(['message' => 'Session de suppression invalide.'], 400);
     } else {
         $state = get_transient(wp_webp_clear_run_key($run_id));
         if (!is_array($state)) {
+            wp_webp_release_operation_lock($run_id);
             wp_send_json_error(['message' => 'Session de suppression expirée.'], 410);
+        }
+        if (!wp_webp_ensure_operation_lock($run_id)) {
+            wp_send_json_error(['message' => 'Une autre opération WP WebP est déjà en cours.'], 409);
         }
     }
 
-    $failures = [];
-    $result = wp_webp_clear_batch($state, 250, $failures);
+    try {
+        $failures = [];
+        $result = wp_webp_clear_batch($state, 250, $failures);
 
-    if ($result['done']) {
+        if ($result['done']) {
+            delete_transient(wp_webp_clear_run_key($run_id));
+            wp_webp_release_operation_lock($run_id);
+        } else {
+            set_transient(wp_webp_clear_run_key($run_id), $state, HOUR_IN_SECONDS);
+        }
+
+        wp_send_json_success([
+            'run_id'   => $run_id,
+            'deleted'  => $result['deleted'],
+            'done'     => $result['done'],
+            'failures' => $failures,
+        ]);
+    } catch (Throwable $e) {
         delete_transient(wp_webp_clear_run_key($run_id));
-    } else {
-        set_transient(wp_webp_clear_run_key($run_id), $state, HOUR_IN_SECONDS);
+        wp_webp_release_operation_lock($run_id);
+        error_log('[WP WebP] clear uploads failed: ' . $e->getMessage());
+        wp_send_json_error(['message' => 'Suppression globale impossible.'], 500);
     }
-
-    wp_send_json_success([
-        'run_id'   => $run_id,
-        'deleted'  => $result['deleted'],
-        'done'     => $result['done'],
-        'failures' => $failures,
-    ]);
 }
 
 function wp_webp_clear_batch(array &$state, $limit = 250, &$failures = null) {
@@ -1911,6 +2960,12 @@ function wp_webp_clear_batch(array &$state, $limit = 250, &$failures = null) {
     $state['current_directory'] = isset($state['current_directory'])
         ? (string) $state['current_directory']
         : '';
+    $state['current_entries'] = isset($state['current_entries']) && is_array($state['current_entries'])
+        ? array_values($state['current_entries'])
+        : null;
+    $state['current_index'] = isset($state['current_index'])
+        ? max(0, (int) $state['current_index'])
+        : 0;
     $state['after_name'] = isset($state['after_name'])
         ? (string) $state['after_name']
         : '';
@@ -1922,45 +2977,47 @@ function wp_webp_clear_batch(array &$state, $limit = 250, &$failures = null) {
             }
 
             $state['current_directory'] = (string) array_shift($state['directories']);
-            $state['after_name'] = '';
+            $state['current_entries'] = null;
+            $state['current_index'] = 0;
         }
 
         $directory = $state['current_directory'];
-        $entries = @scandir($directory);
+        if ($state['current_entries'] === null) {
+            wp_webp_cleanup_stale_temp_files($directory, 250);
+            $entries = @scandir($directory);
 
-        if (!is_array($entries)) {
-            wp_webp_record_failure(
-                $failures,
-                wp_webp_relative_upload_path($directory),
-                'Lecture du dossier impossible'
-            );
-            $state['current_directory'] = '';
-            $state['after_name'] = '';
-            $processed++;
-            continue;
-        }
-
-        $after_name = $state['after_name'];
-        $pending = array_values(array_filter(
-            $entries,
-            static function ($entry) use ($after_name) {
-                return $entry !== '.'
-                    && $entry !== '..'
-                    && strcmp($entry, $after_name) > 0;
+            if (!is_array($entries)) {
+                wp_webp_record_failure(
+                    $failures,
+                    wp_webp_relative_upload_path($directory),
+                    'Lecture du dossier impossible'
+                );
+                $state['current_directory'] = '';
+                $state['current_entries'] = null;
+                $state['current_index'] = 0;
+                $state['after_name'] = '';
+                $processed++;
+                continue;
             }
-        ));
 
-        if ($pending === []) {
-            $state['current_directory'] = '';
+            $after_name = $state['after_name'];
+            $state['current_entries'] = array_values(array_filter(
+                $entries,
+                static function ($entry) use ($after_name) {
+                    return $entry !== '.'
+                        && $entry !== '..'
+                        && ($after_name === '' || strcmp($entry, $after_name) > 0);
+                }
+            ));
+            $state['current_index'] = 0;
             $state['after_name'] = '';
-            continue;
         }
 
-        $batch = array_slice($pending, 0, $limit - $processed);
-
-        foreach ($batch as $entry) {
+        $entry_count = count($state['current_entries']);
+        while ($processed < $limit && $state['current_index'] < $entry_count) {
+            $entry = $state['current_entries'][$state['current_index']];
+            $state['current_index']++;
             $path = wp_normalize_path(trailingslashit($directory) . $entry);
-            $state['after_name'] = $entry;
             $processed++;
 
             if (is_dir($path) && !is_link($path)) {
@@ -1987,8 +3044,10 @@ function wp_webp_clear_batch(array &$state, $limit = 250, &$failures = null) {
             }
         }
 
-        if (count($batch) === count($pending)) {
+        if ($state['current_index'] >= $entry_count) {
             $state['current_directory'] = '';
+            $state['current_entries'] = null;
+            $state['current_index'] = 0;
             $state['after_name'] = '';
         }
     }
@@ -2223,12 +3282,16 @@ function wp_webp_process_attachment($attachment_id, &$failures = null, $metadata
         $metadata = wp_get_attachment_metadata($attachment_id);
     }
     $registered = wp_webp_get_image_sizes();
-    $variants = [[
-        'width' => 0,
-        'height' => 0,
-        'crop' => false,
-        'output_source' => $original,
-    ]];
+    $variants = [];
+
+    if (wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE)) {
+        $variants[] = [
+            'width' => 0,
+            'height' => 0,
+            'crop' => false,
+            'output_source' => $original,
+        ];
+    }
 
     if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
         $dir = trailingslashit(dirname($original));
@@ -2243,7 +3306,6 @@ function wp_webp_process_attachment($attachment_id, &$failures = null, $metadata
             }
 
             if (!wp_webp_size_enabled($size_name)) {
-                wp_webp_delete_attachment_size($attachment_id, $size_name, $failures);
                 continue;
             }
 
@@ -2595,11 +3657,50 @@ function wp_webp_apply_webp_options(Imagick $img, array $profile, $near_lossless
     }
 }
 
+/**
+ * Nettoie un nombre borné de fichiers temporaires abandonnés après un crash.
+ * Les fichiers récents sont conservés pour ne pas perturber une écriture en
+ * cours dans une autre requête.
+ */
+function wp_webp_cleanup_stale_temp_files($directory, $limit = 50) {
+    $directory = (string) $directory;
+    $limit = max(1, min(500, (int) $limit));
+    if (!is_dir($directory)) {
+        return 0;
+    }
+
+    $deleted = 0;
+    $cutoff = time() - WP_WEBP_TEMP_FILE_MAX_AGE;
+    foreach (glob(trailingslashit($directory) . '.wp-webp-*', GLOB_NOSORT) ?: [] as $temporary) {
+        if ($deleted >= $limit) {
+            break;
+        }
+
+        $modified = @filemtime($temporary);
+        if (!is_file($temporary) || $modified === false || $modified > $cutoff) {
+            continue;
+        }
+
+        if (@unlink($temporary)) {
+            $deleted++;
+        }
+    }
+
+    return $deleted;
+}
+
 function wp_webp_write_temp_image(Imagick $img, $target) {
     $directory = dirname($target);
 
     if (!is_dir($directory) || !is_writable($directory)) {
         throw new RuntimeException('Dossier cible inaccessible en écriture');
+    }
+
+    static $cleaned_directories = [];
+    $directory_key = wp_normalize_path($directory);
+    if (!isset($cleaned_directories[$directory_key])) {
+        wp_webp_cleanup_stale_temp_files($directory, 50);
+        $cleaned_directories[$directory_key] = true;
     }
 
     $temporary = tempnam($directory, '.wp-webp-');
@@ -2805,6 +3906,8 @@ function wp_webp_make_webp_from_source(
 
         // Recréation du format depuis l'original via resizeImage (contrôle du
         // blur pour un rendu plus net que les vignettes WordPress).
+        // image_resize_dimensions() renvoie false quand WP n'a rien à faire
+        // (taille déjà atteinte) ou refuse d'upscaler : on encode alors tel quel.
         if ($width > 0 || $height > 0) {
             $blur = isset($profile['blur']) ? (float) $profile['blur'] : 1.0;
             $filter = wp_webp_resolve_filter(isset($profile['filter']) ? $profile['filter'] : 'lanczos');
@@ -2816,18 +3919,17 @@ function wp_webp_make_webp_from_source(
                 $height,
                 $crop
             );
-            if ($dimensions === null) {
-                throw new RuntimeException('Calcul des dimensions WordPress impossible');
-            }
 
-            [, , $src_x, $src_y, $dst_w, $dst_h, $src_w, $src_h] = $dimensions;
-            if ($crop) {
-                $img->cropImage($src_w, $src_h, $src_x, $src_y);
-                $img->setImagePage($src_w, $src_h, 0, 0);
-            }
+            if ($dimensions !== null) {
+                [, , $src_x, $src_y, $dst_w, $dst_h, $src_w, $src_h] = $dimensions;
+                if ($crop) {
+                    $img->cropImage($src_w, $src_h, $src_x, $src_y);
+                    $img->setImagePage($src_w, $src_h, 0, 0);
+                }
 
-            $img->resizeImage($dst_w, $dst_h, $filter, $blur);
-            $img->setImagePage($dst_w, $dst_h, 0, 0);
+                $img->resizeImage($dst_w, $dst_h, $filter, $blur);
+                $img->setImagePage($dst_w, $dst_h, 0, 0);
+            }
         }
 
         // Conserver la géométrie calculée avant l'encodage pour pouvoir passer
@@ -2944,12 +4046,34 @@ function wp_webp_make_webp_from_source(
 /**
  * Ajoute une ligne au rapport d'échecs (si un rapport est suivi).
  */
-function wp_webp_record_failure(&$failures, $file, $error) {
+function wp_webp_record_failure(&$failures, $file, $error, $size = '') {
     if (is_array($failures)) {
-        $failures[] = [
+        $entry = [
             'file'  => $file,
             'error' => $error ?: 'Conversion impossible',
         ];
+        $size = is_string($size) ? $size : '';
+        if ($size !== '') {
+            $entry['size'] = $size;
+        }
+        $failures[] = $entry;
+    }
+}
+
+/**
+ * Attribue un format aux échecs ajoutés depuis `$from_index`.
+ */
+function wp_webp_tag_failures(&$failures, $from_index, $size) {
+    if (!is_array($failures) || $size === '') {
+        return;
+    }
+
+    $from_index = max(0, (int) $from_index);
+    $total = count($failures);
+    for ($i = $from_index; $i < $total; $i++) {
+        if (empty($failures[$i]['size'])) {
+            $failures[$i]['size'] = $size;
+        }
     }
 }
 

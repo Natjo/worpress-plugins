@@ -2,6 +2,11 @@
 
 declare(strict_types=1);
 
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit;
+}
+
 $_SERVER['HTTP_HOST'] = 'starterkit-lonsdale-2027.code';
 
 require '/var/www/html/wp-load.php';

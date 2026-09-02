@@ -2,6 +2,11 @@
 
 declare(strict_types=1);
 
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit;
+}
+
 $_SERVER['HTTP_HOST'] = 'starterkit-lonsdale-2027.code';
 
 require '/var/www/html/wp-load.php';
@@ -15,21 +20,72 @@ if (!mkdir($directory, 0700)) {
 $image = new Imagick();
 $cropImage = new Imagick();
 $failures = [];
+$generationLockOption = 'wp_webp_operation_lock_contract';
+$generationLockOptionFilter = static function () use ($generationLockOption) {
+    return $generationLockOption;
+};
+add_filter('wp_webp_operation_lock_option_name', $generationLockOptionFilter);
+$generationLockBefore = get_option($generationLockOption, null);
+$generationLockExisted = $generationLockBefore !== null;
+$disabledSizesBefore = get_option(WP_WEBP_DISABLED_SIZES_OPTION, null);
+$disabledSizesExisted = $disabledSizesBefore !== null;
+$showOriginalBefore = get_option(WP_WEBP_SHOW_ORIGINAL_OPTION, null);
+$showOriginalExisted = $showOriginalBefore !== null;
+delete_option($generationLockOption);
 
 try {
     $profiles = wp_webp_profiles();
     if (
-        ($profiles['best']['quality'] ?? 0) !== 85
+        ($profiles['finest']['quality'] ?? 0) !== 85
+        || ($profiles['natural']['quality'] ?? 0) !== 80
         || ($profiles['optimal']['quality'] ?? 0) !== 75
         || ($profiles['green']['quality'] ?? 0) !== 68
-        || ($profiles['best']['near_lossless'] ?? 0) !== 85
+        || ($profiles['finest']['near_lossless'] ?? 0) !== 85
+        || ($profiles['natural']['near_lossless'] ?? 0) !== 70
         || ($profiles['optimal']['near_lossless'] ?? 0) !== 55
         || ($profiles['green']['near_lossless'] ?? 0) !== 40
-        || empty($profiles['best']['cap_to_original'])
+        || (float) ($profiles['natural']['sigma'] ?? 1) !== 0.0
+        || empty($profiles['finest']['cap_to_original'])
+        || empty($profiles['natural']['cap_to_original'])
         || empty($profiles['optimal']['cap_to_original'])
         || empty($profiles['green']['cap_to_original'])
+        || wp_webp_normalize_profile_key('best') !== 'finest'
     ) {
-        $failures[] = 'Les profils Best, Optimal et Green sont incohérents.';
+        $failures[] = 'Les profils Finest, Natural, Optimal et Green sont incohérents.';
+    }
+
+    update_option(WP_WEBP_DISABLED_SIZES_OPTION, [WP_WEBP_ORIGINAL_SIZE]);
+    update_option(WP_WEBP_SHOW_ORIGINAL_OPTION, '0');
+    if (
+        wp_webp_show_original_size()
+        || !wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE)
+        || in_array(WP_WEBP_ORIGINAL_SIZE, wp_webp_get_disabled_managed_sizes(), true)
+    ) {
+        $failures[] = 'Le format original masqué n’est pas forcé actif.';
+    }
+    update_option(WP_WEBP_SHOW_ORIGINAL_OPTION, '1');
+    if (
+        !wp_webp_show_original_size()
+        || wp_webp_size_enabled(WP_WEBP_ORIGINAL_SIZE)
+    ) {
+        $failures[] = 'Le format original affiché ne respecte pas la sélection Compresser.';
+    }
+    if ($disabledSizesExisted) {
+        update_option(WP_WEBP_DISABLED_SIZES_OPTION, $disabledSizesBefore);
+    } else {
+        delete_option(WP_WEBP_DISABLED_SIZES_OPTION);
+    }
+    if ($showOriginalExisted) {
+        update_option(WP_WEBP_SHOW_ORIGINAL_OPTION, $showOriginalBefore);
+    } else {
+        delete_option(WP_WEBP_SHOW_ORIGINAL_OPTION);
+    }
+    if (
+        wp_webp_job_size(['type' => 'original']) !== WP_WEBP_ORIGINAL_SIZE
+        || wp_webp_job_size(['type' => 'size', 'name' => 'thumbnail']) !== 'thumbnail'
+        || wp_webp_job_size(['type' => 'size'], 'medium') !== 'medium'
+    ) {
+        $failures[] = 'L’attribution d’un job à son format est incorrecte.';
     }
 
     $image->newImage(32, 24, new ImagickPixel('#c0392b'));
@@ -60,6 +116,19 @@ try {
     $image->writeImage($directory . '/collision.jpg');
     $image->setImageFormat('png');
     $image->writeImage($directory . '/collision.png');
+
+    file_put_contents($directory . '/.wp-webp-stale', 'stale');
+    file_put_contents($directory . '/.wp-webp-fresh', 'fresh');
+    touch($directory . '/.wp-webp-stale', time() - WP_WEBP_TEMP_FILE_MAX_AGE - 10);
+    $staleDeleted = wp_webp_cleanup_stale_temp_files($directory);
+    if (
+        $staleDeleted !== 1
+        || is_file($directory . '/.wp-webp-stale')
+        || !is_file($directory . '/.wp-webp-fresh')
+    ) {
+        $failures[] = 'Le nettoyage borné des fichiers temporaires est incorrect.';
+    }
+    @unlink($directory . '/.wp-webp-fresh');
 
     $cropFailures = [];
     $cropSource = new Imagick($directory . '/crop-source.png');
@@ -361,6 +430,21 @@ try {
             $failures[] = 'Le traitement groupé ne génère pas toutes les déclinaisons de l’attachement.';
         }
 
+        $deleteGroupedFailures = [];
+        $deleteGroupedCount = wp_webp_delete_attachment_sizes(
+            $groupedAttachmentId,
+            [WP_WEBP_ORIGINAL_SIZE, 'thumbnail'],
+            $deleteGroupedFailures
+        );
+        if (
+            $deleteGroupedCount !== 2
+            || is_file($directory . '/grouped.webp')
+            || is_file($directory . '/grouped-150x150.webp')
+            || $deleteGroupedFailures !== []
+        ) {
+            $failures[] = 'La suppression groupée recharge ou traite mal les formats.';
+        }
+
         wp_delete_attachment($groupedAttachmentId, true);
     }
 
@@ -398,24 +482,40 @@ try {
     }
     remove_filter('wp_webp_reuse_source_max_pixels', $disableSourceReuse);
 
-    [$runIdA, $runStateA] = wp_webp_create_generation_run();
-    [$runIdB, $runStateB] = wp_webp_create_generation_run();
+    $runIdA = 'cccccccccccccccccccc';
+    $runIdB = 'dddddddddddddddddddd';
+    $firstRunAcquired = wp_webp_acquire_operation_lock($runIdA);
+    $secondRunBlocked = !wp_webp_acquire_operation_lock($runIdB);
     if (
-        $runIdA === $runIdB
-        || wp_webp_generation_run_key($runIdA) === wp_webp_generation_run_key($runIdB)
-        || wp_webp_get_generation_run($runIdA) !== $runStateA
-        || wp_webp_get_generation_run($runIdB) !== $runStateB
+        !$firstRunAcquired
+        || !$secondRunBlocked
+        || (wp_webp_get_operation_lock()['run_id'] ?? '') !== $runIdA
+        || !wp_webp_refresh_operation_lock($runIdA)
     ) {
-        $failures[] = 'Les sessions de génération ne sont pas isolées.';
+        $failures[] = 'Le verrou global n’isole pas les générations concurrentes.';
     }
-    delete_transient(wp_webp_generation_run_key($runIdA));
-    delete_transient(wp_webp_generation_run_key($runIdB));
+    wp_webp_release_operation_lock($runIdA);
+
+    update_option($generationLockOption, [
+        'run_id' => 'aaaaaaaaaaaaaaaaaaaa',
+        'user_id' => 0,
+        'expires' => time() - 1,
+    ], false);
+    $replacementRunId = 'bbbbbbbbbbbbbbbbbbbb';
+    if (
+        !wp_webp_acquire_operation_lock($replacementRunId)
+        || (wp_webp_get_operation_lock()['run_id'] ?? '') !== $replacementRunId
+    ) {
+        $failures[] = 'Un verrou expiré empêche encore une nouvelle génération.';
+    }
+    wp_webp_release_operation_lock($replacementRunId);
 
     foreach ([
         'wp_webp_count_attachments',
         'wp_webp_get_attachment_ids',
         'wp_webp_count_total_jobs',
         'wp_webp_generate_for_attachment',
+        'wp_webp_ajax_cleanup_size',
     ] as $removedFunction) {
         if (function_exists($removedFunction)) {
             $failures[] = 'L’ancienne fonction ' . $removedFunction . ' existe encore.';
@@ -478,6 +578,23 @@ try {
         $failures[] = 'Le nettoyage des WebP obsolètes a échoué.';
     }
 } finally {
+    if ($disabledSizesExisted) {
+        update_option(WP_WEBP_DISABLED_SIZES_OPTION, $disabledSizesBefore);
+    } else {
+        delete_option(WP_WEBP_DISABLED_SIZES_OPTION);
+    }
+    if ($showOriginalExisted) {
+        update_option(WP_WEBP_SHOW_ORIGINAL_OPTION, $showOriginalBefore);
+    } else {
+        delete_option(WP_WEBP_SHOW_ORIGINAL_OPTION);
+    }
+    if ($generationLockExisted) {
+        update_option($generationLockOption, $generationLockBefore, false);
+    } else {
+        delete_option($generationLockOption);
+    }
+    remove_filter('wp_webp_operation_lock_option_name', $generationLockOptionFilter);
+
     $image->clear();
     $image->destroy();
     $cropImage->clear();
